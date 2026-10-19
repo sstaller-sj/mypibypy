@@ -5,6 +5,9 @@ Examples
 Design every locus in a loci file (see `loci` for the format and search order):
     python -m mypibypy batch --loci loci.local.json -o out.xlsx
 
+Serve the same pipeline to Claude Desktop / Claude Code (needs the `mcp` extra):
+    python -m mypibypy mcp
+
 Design one locus given on the command line:
     python -m mypibypy design --build mm10 --region chr5:142906255-142906754 \
         --system cy5 --gene Actb --name promoter -o out.xlsx
@@ -97,7 +100,7 @@ def _backend_from(args):
         return None
 
 
-def _warn_if_example(loci_path=None) -> list[str]:
+def example_warnings(loci_path=None) -> list[str]:
     """Placeholder inputs must never be mistaken for an orderable design."""
     warnings = []
     systems()  # force resolution so loaded_from() is populated
@@ -111,6 +114,28 @@ def _warn_if_example(loci_path=None) -> list[str]:
             f"target loci are the shipped example ({resolve_loci_path(loci_path)}); "
             "pass --loci or create loci.local.json for your own targets"
         )
+    return warnings
+
+
+def design_warnings(results, requested_pairs: int = 1) -> list[str]:
+    """What a set of results falls short on: fewer pairs than asked, or no screen.
+
+    An unscreened design must carry that fact into the workbook's provenance
+    note, not only into the specificity cell. Shared with the MCP server so both
+    write the same note for the same results.
+    """
+    warnings = []
+    short = [f"{r.locus.name} ({r.n_pairs})" for r in results
+             if r.n_pairs < requested_pairs]
+    if short:
+        warnings.append(
+            f"asked for {requested_pairs} pairs but the target only fits fewer at "
+            f"this spacing: {', '.join(short)}")
+    unscreened = [r.locus.name for r in results
+                  if not all(sc.screened for sc in r.pair_screens)]
+    if unscreened:
+        warnings.append(
+            f"no genome-wide specificity screen was run for: {', '.join(unscreened)}")
     return warnings
 
 
@@ -162,7 +187,17 @@ def main(argv=None):
     _tiling_options(d)
     _specificity_options(d)
 
+    sub.add_parser("mcp", help="serve the design tools to an MCP client "
+                               "(Claude Desktop / Claude Code) over stdio")
+
     args = ap.parse_args(argv)
+
+    if args.cmd == "mcp":
+        # Imported here: the server needs the optional `mcp` package, and the
+        # rest of the CLI must not.
+        from .mcp_server import main as serve
+        serve()
+        return
 
     if args.cmd == "rna":
         targets = load_rna_targets(args.loci)
@@ -170,7 +205,7 @@ def main(argv=None):
             raise SystemExit(
                 f"no RNA targets defined in {resolve_loci_path(args.loci)} "
                 "(add an 'rna_targets' key -- see loci.example.json)")
-        warnings = _warn_if_example(args.loci)
+        warnings = example_warnings(args.loci)
         backend = genome_backend = None
         if not args.no_screen:
             try:
@@ -192,7 +227,7 @@ def main(argv=None):
             raise SystemExit(
                 f"no fusions defined in {resolve_loci_path(args.loci)} "
                 "(add a 'fusions' key -- see loci.example.json)")
-        warnings = _warn_if_example(args.loci)
+        warnings = example_warnings(args.loci)
         backend = _backend_from(args)
         results = []
         for j in fusions:
@@ -210,7 +245,7 @@ def main(argv=None):
                 f"pad assignment {args.pad_assignment}.")
     elif args.cmd == "batch":
         loci = load_loci(args.loci)
-        warnings = _warn_if_example(args.loci)
+        warnings = example_warnings(args.loci)
         backend = _backend_from(args)
         results = [design_locus(L, backend=backend, screen=not args.no_screen,
                                 n_pairs=args.pairs, min_spacing=args.min_spacing)
@@ -223,25 +258,13 @@ def main(argv=None):
             raise SystemExit(f"unknown --system {args.system!r}; configured systems: {known}")
         locus = Locus(args.name, args.gene, args.name,
                       _parse_region(args.build, args.region), args.system)
-        warnings = _warn_if_example()
+        warnings = example_warnings()
         backend = _backend_from(args)
         results = [design_locus(locus, backend=backend, screen=not args.no_screen,
                                 n_pairs=args.pairs, min_spacing=args.min_spacing)]
         note = f"mypibypy design: {locus.interval}."
 
-    # An unscreened design must carry that fact into the workbook's provenance
-    # note, not only into the specificity cell.
-    requested = getattr(args, "pairs", 1)
-    short = [f"{r.locus.name} ({r.n_pairs})" for r in results if r.n_pairs < requested]
-    if short:
-        warnings.append(
-            f"asked for {requested} pairs but the target only fits fewer at this "
-            f"spacing: {', '.join(short)}")
-    unscreened = [r.locus.name for r in results
-                  if not all(sc.screened for sc in r.pair_screens)]
-    if unscreened:
-        warnings.append(
-            f"no genome-wide specificity screen was run for: {', '.join(unscreened)}")
+    warnings += design_warnings(results, getattr(args, "pairs", 1))
     for w in warnings:
         note += f" WARNING: {w}."
     write_workbook(args.out, results, note)

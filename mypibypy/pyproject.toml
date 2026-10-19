@@ -17,9 +17,12 @@ dependencies = ["openpyxl>=3.1"]
 # is optional at runtime: the features that use them report an explicit
 # not-screened / not-evaluated status when they are absent.
 dev = ["pytest>=8"]
+# The MCP server (`python -m mypibypy mcp`). Only that subcommand imports it.
+mcp = ["mcp>=2.3"]
 
 [project.scripts]
 mypibypy = "mypibypy.cli:main"
+mypibypy-mcp = "mypibypy.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

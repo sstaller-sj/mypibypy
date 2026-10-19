@@ -135,6 +135,7 @@ example systems or example loci are in use -- those outputs are not orderable.
 | `outcomes.py`    | design → imaging-result record, for calibrating thresholds later |
 | `agent/`         | the agent loop: closed actions, bounds, budgets, run record      |
 | `ui.py`          | presentation helpers for the Streamlit app (testable apart from it) |
+| `mcp_server.py`  | the pipeline as MCP tools for Claude Desktop / Claude Code       |
 | `workbook.py`    | render the order workbook (ORDER_ssDNA / Parts list / per-locus) |
 | `cli.py`         | `python -m mypibypy`                                             |
 
@@ -568,6 +569,90 @@ form — less trustworthy, if anything. The model's sentence is shown as
 *"Model comment"* and never interpreted. And when a relaxation is asked for while
 the GC/Tm window is not being enforced, the reply says so, rather than reporting
 a change that had no effect.
+
+## Driving it from Claude (MCP server)
+
+The agent layer has mypibypy call a model. The MCP server turns that around:
+Claude Desktop or Claude Code calls mypibypy, as a set of tools, inside a
+conversation that can also do other work. Both run on the same `pipeline`, so a
+design is the same design whichever way it was asked for. And because it runs
+under the Claude apps, it needs **no API key**; a Claude seat is enough.
+
+```bash
+pip install -e ".[mcp]"          # adds the `mcp` SDK; nothing else imports it
+python -m mypibypy mcp           # stdio server; an MCP client launches this itself
+```
+
+| tool | does |
+|---|---|
+| `status` | which systems / loci files are loaded, whether they are placeholders, which screens are configured, where workbooks go |
+| `list_targets` | every locus, fusion and RNA target in the loci file, with its id |
+| `design_target` | design and screen one target by id; tiling, spacing and channel are parameters |
+| `write_order` | write one order workbook for designs from this session; returns its path |
+
+Under MCP the client decides what to call and in what order, so the agent's fixed
+decision structure no longer applies. What each tool accepts and returns is the
+whole safety story, and the rules for that are enforced in code:
+
+- **No tool takes a sequence, a target or a path.** Targets are addressed by id
+  from the loci file, so Claude cannot point the pipeline at a region,
+  accession or file of its own. To design something new, add it to
+  `loci.local.json`. `tests/test_mcp_server.py` checks this against the schemas
+  the server actually advertises.
+- **No tool returns a base.** Results carry pair names, coordinates, GC, Tm,
+  QC flags and screen verdicts. The oligo sequences go only into the workbook,
+  which the server names and saves under `designs/` (gitignored), so unpublished
+  sequences are not sent to the model provider in a tool result.
+- **Unscreened is said out loud.** Each pair reports `NOT SCREENED` with its
+  reason, and placeholder systems or loci are flagged in every result.
+- **Every design is recorded** in the agent run record (`agent_runs.local.jsonl`,
+  model `mcp-client`), including clamped parameters and refusals.
+
+Numbers go through the same `clamp` as the form and the chat. An unknown channel
+is refused, and fusions refuse tiling for the reason given above.
+
+**Registering it.** Use the conda env's Python, and put the env's `bin` on
+`PATH` so bowtie, blastn and RNAplfold are found. MCP clients start servers with
+a minimal environment. If the variables below are unset, the server uses
+`systems.local.json`, `loci.local.json` and `designs/` from this directory.
+
+Claude Code:
+
+```bash
+claude mcp add mypibypy --scope user \
+  -e PATH="$HOME/miniforge3/envs/pifish-tools/bin:/usr/bin:/bin" \
+  -e MYPIBYPY_BOWTIE_INDEX=/path/to/hg38 \
+  -- "$HOME/miniforge3/envs/pifish-tools/bin/python" -m mypibypy mcp
+```
+
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "mypibypy": {
+      "command": "/Users/YOU/miniforge3/envs/pifish-tools/bin/python",
+      "args": ["-m", "mypibypy", "mcp"],
+      "env": {
+        "PATH": "/Users/YOU/miniforge3/envs/pifish-tools/bin:/usr/bin:/bin",
+        "MYPIBYPY_BOWTIE_INDEX": "/path/to/hg38",
+        "MYPIBYPY_TRANSCRIPTOME_INDEX": "/path/to/gencode/transcripts"
+      }
+    }
+  }
+}
+```
+
+| variable | default |
+|---|---|
+| `MYPIBYPY_SYSTEMS`, `MYPIBYPY_LOCI` | the `*.local.json` beside `pyproject.toml`, else the usual search |
+| `MYPIBYPY_BOWTIE_INDEX` / `MYPIBYPY_BLAST_DB` | none: DNA designs are `NOT SCREENED` |
+| `MYPIBYPY_TRANSCRIPTOME_INDEX` | none: RNA designs are `NOT SCREENED` (see `RNA_SCREEN_POLICY`) |
+| `MYPIBYPY_MCP_OUT` | `designs/` beside `pyproject.toml` |
+| `MYPIBYPY_AGENT_RUNS` | `agent_runs.local.jsonl` beside `pyproject.toml` |
+
+Designs are held in memory, so `write_order` only knows designs made since the
+server started.
 
 ## Recording what happened
 

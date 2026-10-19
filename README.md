@@ -34,6 +34,9 @@ python -m mypibypy batch  --loci loci.local.json -o order.xlsx --pairs 6
 
 # or drive it from a browser
 streamlit run mypibypy/app.py
+
+# or from Claude Desktop / Claude Code, as MCP tools (no API key needed)
+pip install -e "./mypibypy[mcp]" && python -m mypibypy mcp
 ```
 
 ## What is in here
@@ -42,7 +45,7 @@ streamlit run mypibypy/app.py
 |---|---|
 | [`mypibypy/`](mypibypy/) | the package, its tests, and [the real README](mypibypy/README.md) |
 | [`mypibypy/src/mypibypy/`](mypibypy/src/mypibypy/) | design, screening and workbook modules |
-| [`mypibypy/tests/`](mypibypy/tests/) | 346 tests; aligner-, folding- and network-backed ones skip when unavailable. No test makes an API call |
+| [`mypibypy/tests/`](mypibypy/tests/) | 436 tests; aligner-, folding- and network-backed ones skip when unavailable. No test makes an API call |
 | [`mypibypy/scripts/`](mypibypy/scripts/) | threshold calibration and backend sensitivity benchmarks |
 
 ## No sequences in this repository
