@@ -75,6 +75,7 @@ Configuration (first that resolves wins):
 from __future__ import annotations
 
 import bisect
+import math
 import os
 import shutil
 import subprocess
@@ -83,6 +84,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import thermo
+from .expression import EXPRESSION_IS_UNCALIBRATED, ExpressionTable
 from .sequence import GenomicInterval
 
 #: Report statuses. `SCREENED` is the only one that licenses a specificity claim.
@@ -229,6 +231,10 @@ class Hit:
     q_start: int = 1    # 1-based inclusive, on the query
     q_end: int = 0      # 0 means "to the end of the query"
     gene: str = ""      # "" when the reference carries no gene information
+    #: The reference over the aligned block, in query orientation -- what the
+    #: probe actually meets there. "" when the aligner did not report it or the
+    #: alignment is gapped; thermodynamics then falls back to the mismatch count.
+    ref_seq: str = ""
 
     @property
     def unaligned(self) -> int:
@@ -257,6 +263,24 @@ class Hit:
         """The part of the query that actually paired, for thermodynamics."""
         end = self.q_end or self.query_len
         return query_seq[max(0, self.q_start - 1) : end]
+
+    def site_seq(self, query_seq: str) -> str | None:
+        """The off-target sequence opposite `duplex_seq`, or None if not known."""
+        if self.ref_seq and len(self.ref_seq) == len(self.duplex_seq(query_seq)):
+            return self.ref_seq
+        return None
+
+    def mismatch_offsets(self, query_seq: str) -> tuple[int, ...]:
+        """0-based positions in the duplex where the site differs from the query.
+
+        Empty when the site sequence is unknown -- check `site_seq` first if the
+        difference between "no mismatches" and "not known" matters.
+        """
+        site = self.site_seq(query_seq)
+        if site is None:
+            return ()
+        duplex = self.duplex_seq(query_seq).upper()
+        return tuple(i for i, (a, b) in enumerate(zip(duplex, site)) if a != b)
 
     @property
     def interval(self) -> tuple[str, int, int]:
@@ -294,10 +318,29 @@ class PairSite:
     min_margin_c: float     # worst per-step Tm margin across both halves
     signal_gap_nt: int = DEFAULT_SIGNAL_GAP_NT
     gene: str = ""      # "" when the reference carries no gene information
+    #: Equilibrium occupancy of each half at its limiting step -- see
+    #: `thermo.fraction_bound`. NaN when a half was priced by mismatch count,
+    #: which gives a Tm but no dH/dS to turn into an occupancy.
+    left_fraction: float = float("nan")
+    right_fraction: float = float("nan")
+    #: Which thermodynamic model priced the two halves, e.g. "nearest-neighbour
+    #: mismatch" or "flat per-mismatch penalty". "" for sites built by hand.
+    thermo_model: str = ""
 
     @property
     def locus_label(self) -> str:
         return self.gene or self.chrom
+
+    @property
+    def fraction_bound(self) -> float:
+        """Both halves must be bound to make a spot: their product, NaN if unknown.
+
+        Treats the halves as independent. That ignores the cooperativity P2
+        adds once it bridges them, so it understates a site that has already
+        nucleated -- it is a ranking number, comparable with the on-target value
+        in `SpecificityReport.on_target_fraction`, not an absolute prediction.
+        """
+        return self.left_fraction * self.right_fraction
 
     @property
     def signal_capable(self) -> bool:
@@ -322,9 +365,11 @@ class PairSite:
     def __str__(self) -> str:
         kind = "SIGNAL-CAPABLE" if self.signal_capable else "co-localized"
         wash = "survives wash" if self.survives_wash else "melts in wash"
+        frac = self.fraction_bound
+        bound = "" if frac != frac else f", P(bound) {frac:.2g}"
         return (f"{kind} {self.locus_label}:{min(self.left.start, self.right.start):,} "
                 f"gap {self.gap_nt} nt, {self.total_mismatches} mm total, "
-                f"{wash} (worst margin {self.min_margin_c:+.1f} C)")
+                f"{wash} (worst margin {self.min_margin_c:+.1f} C{bound})")
 
 
 # --- Backends --------------------------------------------------------------
@@ -363,8 +408,9 @@ class Backend:
         raise ValueError(f"unknown backend tool {self.tool!r}")
 
     # -- blastn ------------------------------------------------------------
+    #: qseq/sseq come last so the 13 columns before them keep their indices.
     _FMT = ("6 qseqid sseqid pident length mismatch gapopen qstart qend "
-            "sstart send evalue bitscore qlen")
+            "sstart send evalue bitscore qlen qseq sseq")
 
     def _blastn(self, queries: dict[str, str]) -> list[Hit]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,10 +460,15 @@ class Backend:
             start, end = (sstart, send) if strand == "+" else (send, sstart)
             if qstart > qend:            # minus-strand query coordinates
                 qstart, qend = qend, qstart
+            # sseq is already in query orientation for either strand. A gapped
+            # alignment has no position-for-position site, so it is not kept.
+            sseq = f[14].upper() if len(f) >= 15 else ""
+            if "-" in sseq or "-" in (f[13] if len(f) >= 15 else ""):
+                sseq = ""
             hits.append(Hit(query=qid, chrom=sid, start=start, end=end, strand=strand,
                             mismatches=mism, gaps=gaps, aligned=qend - qstart + 1,
                             query_len=len(queries.get(qid, "")) or qlen,
-                            q_start=qstart, q_end=qend))
+                            q_start=qstart, q_end=qend, ref_seq=sseq))
         return hits
 
     # -- bowtie v1 ---------------------------------------------------------
@@ -455,17 +506,52 @@ class Backend:
             if flag & 0x4 or ref == "*":
                 continue
             seq_len = len(queries.get(qid, "")) or len(f[9])
-            nm = 0
+            nm, md = 0, ""
             for tag in f[11:]:
                 if tag.startswith("NM:i:"):
                     nm = int(tag[5:])
-                    break
+                elif tag.startswith("MD:Z:"):
+                    md = tag[5:]
+            reverse = bool(flag & 0x10)
             # bowtie v1 -v N is end-to-end: the whole read aligns, always.
             hits.append(Hit(query=qid, chrom=ref, start=pos, end=pos + seq_len - 1,
-                            strand="-" if flag & 0x10 else "+",
+                            strand="-" if reverse else "+",
                             mismatches=nm, gaps=0, aligned=seq_len, query_len=seq_len,
-                            q_start=1, q_end=seq_len))
+                            q_start=1, q_end=seq_len,
+                            ref_seq=_site_from_md(f[9], md, reverse)))
         return hits
+
+
+_REVCOMP = str.maketrans("ACGTN", "TGCAN")
+
+
+def _site_from_md(sam_seq: str, md: str, reverse: bool) -> str:
+    """The reference under an ungapped SAM alignment, in query orientation.
+
+    SAM stores SEQ on the reference's forward strand -- reverse-complemented for
+    a minus-strand hit -- and MD lists the reference base at each substitution
+    in the same frame. Rebuild the forward reference, then turn it back to the
+    query's orientation. "" when MD is absent, carries a deletion (``^``), or
+    does not account for every base, rather than a guess.
+    """
+    if not md or "^" in md:
+        return ""
+    out, i, num = [], 0, ""
+    for ch in md + "$":
+        if ch.isdigit():
+            num += ch
+            continue
+        n = int(num or 0)
+        out.append(sam_seq[i : i + n])
+        i, num = i + n, ""
+        if ch == "$":
+            break
+        out.append(ch)
+        i += 1
+    site = "".join(out).upper()
+    if len(site) != len(sam_seq) or i != len(sam_seq):
+        return ""
+    return site[::-1].translate(_REVCOMP) if reverse else site
 
 
 def resolve_backend(bowtie_index: str | None = None, blast_db: str | None = None,
@@ -556,16 +642,32 @@ def _database_problem(tool: str, db: str) -> str | None:
 
 # --- Pairing ---------------------------------------------------------------
 
+@dataclass(frozen=True)
+class WashOutcome:
+    """What thermo says about the duplex one hit would form."""
+
+    survives: bool
+    min_margin_c: float
+    fraction_bound: float   # at the limiting step; NaN under the count model
+    model: str
+
+
 def _wash_outcome(hit: Hit, query_seq: str,
                   steps: tuple[thermo.Conditions, ...] = thermo.ALL_STEPS,
                   penalty_c: float = thermo.DEFAULT_MISMATCH_PENALTY_C,
-                  ) -> tuple[bool, float]:
-    """(survives every step, worst margin) for the duplex this hit would form."""
+                  ) -> WashOutcome:
+    """Survival, worst margin and occupancy for the duplex this hit would form.
+
+    Priced from the off-target sequence when the aligner reported it, so a
+    mismatch's position and identity count; by mismatch count otherwise.
+    """
     duplex = hit.duplex_seq(query_seq)
     if len(duplex) < 2:
-        return False, float("-inf")
-    pr = thermo.profile(duplex, hit.mismatches + hit.gaps, steps, penalty_c)
-    return pr["survives"], pr["min_margin_c"]
+        return WashOutcome(False, float("-inf"), 0.0, thermo.MODEL_PERFECT)
+    pr = thermo.profile(duplex, hit.mismatches + hit.gaps, steps, penalty_c,
+                        site=hit.site_seq(query_seq))
+    return WashOutcome(pr["survives"], pr["min_margin_c"], pr["min_fraction_bound"],
+                       pr["model"])
 
 
 def pair_hits(left_hits: list[Hit], right_hits: list[Hit], left_seq: str,
@@ -617,13 +719,17 @@ def pair_hits(left_hits: list[Hit], right_hits: list[Hit], left_seq: str,
             # carrying its own substitutions -- not the full 25-nt pad. A hit
             # BLAST trimmed to 20 nt makes a 20-bp duplex, and asking thermo
             # about the 25-mer would overstate it.
-            l_ok, l_margin = _wash_outcome(lh, left_seq, steps, penalty_c)
-            r_ok, r_margin = _wash_outcome(rh, right_seq, steps, penalty_c)
+            lw = _wash_outcome(lh, left_seq, steps, penalty_c)
+            rw = _wash_outcome(rh, right_seq, steps, penalty_c)
             sites.append(PairSite(
                 chrom=lh.chrom, left=lh, right=rh, gap_nt=gap,
                 same_strand=lh.strand == rh.strand, correct_order=correct_order,
-                survives_wash=l_ok and r_ok, min_margin_c=min(l_margin, r_margin),
+                survives_wash=lw.survives and rw.survives,
+                min_margin_c=min(lw.min_margin_c, rw.min_margin_c),
                 signal_gap_nt=signal_gap_nt, gene=lh.gene or rh.gene,
+                left_fraction=lw.fraction_bound, right_fraction=rw.fraction_bound,
+                thermo_model=(lw.model if lw.model == rw.model
+                              else f"{lw.model} / {rw.model}"),
             ))
     sites.sort(key=lambda s: (not s.signal_capable, not s.survives_wash,
                               s.total_mismatches))
@@ -689,6 +795,11 @@ class SpecificityReport:
     right_hits: list[Hit] = field(default_factory=list)
     pair_sites: list[PairSite] = field(default_factory=list)
     on_target: GenomicInterval | None = None
+    #: Occupancy of the designed pair on its own target at the limiting step,
+    #: on the same scale as `PairSite.fraction_bound`.
+    on_target_fraction: float = float("nan")
+    #: Per-gene abundance in the imaged cell type, when supplied. See `expression`.
+    expression: ExpressionTable | None = None
 
     @property
     def screened(self) -> bool:
@@ -731,7 +842,61 @@ class SpecificityReport:
         """Lone-half hits whose duplex is predicted to hold through the washes."""
         seqs = {"left": self.left_seq, "right": self.right_seq}
         return [h for h in self.single_half_hits
-                if seqs.get(h.query) and _wash_outcome(h, seqs[h.query])[0]]
+                if seqs.get(h.query) and _wash_outcome(h, seqs[h.query]).survives]
+
+    # -- expression --------------------------------------------------------
+
+    @property
+    def expression_evaluated(self) -> bool:
+        """True only when off-target genes could be weighted by abundance."""
+        return self.screened and self.expression is not None and self.gene_aware
+
+    @property
+    def expression_reason(self) -> str:
+        """Why weighting did not happen, or "" when it did."""
+        if self.expression_evaluated:
+            return ""
+        if not self.screened:
+            return "no screen was run"
+        if self.expression is None:
+            return "no expression table supplied"
+        return ("the reference carries no gene names (a genome screen), so "
+                "off-target sites cannot be matched to expression")
+
+    def _weight(self, site: PairSite) -> float:
+        if not self.expression_evaluated or not site.gene:
+            return 1.0
+        return self.expression.weight(site.gene)
+
+    @property
+    def offtarget_expression(self) -> list[tuple[str, float | None]]:
+        """(gene, TPM or None if absent from the table) per off-target gene."""
+        if not self.expression_evaluated:
+            return []
+        return [(g, self.expression.lookup(g)) for g in self.offtarget_genes]
+
+    @property
+    def _failing_sites(self) -> list[PairSite]:
+        return [s for s in self.pair_sites if s.survives_wash and s.signal_capable]
+
+    @property
+    def low_expression_only(self) -> bool:
+        """Every failing site is on a gene the table puts below its TPM floor.
+
+        A gene missing from the table is never "low" -- see `expression`.
+        """
+        failing = self._failing_sites
+        return (self.expression_evaluated and bool(failing)
+                and all(s.gene and self.expression.below_floor(s.gene) for s in failing))
+
+    # -- occupancy ---------------------------------------------------------
+
+    @property
+    def worst_offtarget_fraction(self) -> float:
+        """Highest occupancy among signal-capable sites; NaN if none was priced."""
+        vals = [s.fraction_bound for s in self.pair_sites
+                if s.signal_capable and not math.isnan(s.fraction_bound)]
+        return max(vals) if vals else float("nan")
 
     @property
     def score(self) -> float:
@@ -740,12 +905,15 @@ class SpecificityReport:
             return float("nan")
         score = 1.0
         for s in self.pair_sites:
+            # Scaled by the off-target gene's abundance when a table was given;
+            # 1.0 otherwise, so an unweighted screen scores exactly as before.
+            w = self._weight(s)
             if s.survives_wash and s.signal_capable:
-                score -= PENALTY_SURVIVING_SIGNAL_CAPABLE
+                score -= PENALTY_SURVIVING_SIGNAL_CAPABLE * w
             elif s.survives_wash:
-                score -= PENALTY_SURVIVING_COLOCALIZED
+                score -= PENALTY_SURVIVING_COLOCALIZED * w
             else:
-                score -= PENALTY_NONSURVIVING_PAIR
+                score -= PENALTY_NONSURVIVING_PAIR * w
         # A lone half cannot recruit P2, so it cannot make a spot. It still costs
         # something -- it is probe sequestered elsewhere, and it is where a
         # second nearby hit would turn into a real site -- but only a little, and
@@ -759,8 +927,10 @@ class SpecificityReport:
         """``pass`` / ``review`` / ``fail`` / ``not screened``."""
         if not self.screened:
             return "not screened"
-        if any(s.survives_wash and s.signal_capable for s in self.pair_sites):
-            return "fail"
+        # Low expression softens a fail to a review, never to a pass: the table
+        # is an average over some cell population, not the cell being imaged.
+        if self._failing_sites:
+            return "review" if self.low_expression_only else "fail"
         if self.pair_sites or self.score < 0.9:
             return "review"
         return "pass"
@@ -795,6 +965,23 @@ class SpecificityReport:
             if self.n_sites_before_collapse > len(self.pair_sites):
                 text += (f"; {self.n_sites_before_collapse} raw sites collapsed to "
                          f"{len(self.pair_sites)} by gene and geometry")
+        if self.expression_evaluated:
+            expr = self.offtarget_expression
+            if expr:
+                shown = ", ".join(f"{g} {'not in table' if t is None else f'{t:g} TPM'}"
+                                  for g, t in expr[:6])
+                text += f"; off-target expression: {shown}{'...' if len(expr) > 6 else ''}"
+            if self.low_expression_only:
+                text += (f"; every failing off-target gene is below "
+                         f"{self.expression.min_tpm:g} TPM, so fail is softened to review")
+            text += f" [weighted by {self.expression.describe()}]"
+        elif self.expression is not None:
+            text += f"; expression weighting NOT EVALUATED -- {self.expression_reason}"
+        if not math.isnan(self.on_target_fraction):
+            text += f"; on-target P(bound) {self.on_target_fraction:.2g}"
+            worst = self.worst_offtarget_fraction
+            if not math.isnan(worst):
+                text += f" vs worst signal-capable off-target {worst:.2g}"
         text += (
             f" -- verdict {self.verdict} "
             f"[{self.n_raw_hits} raw alignments; {self.n_dropped_mismatch} over "
@@ -829,6 +1016,15 @@ class SpecificityReport:
             "n_sites_before_collapse": self.n_sites_before_collapse,
             "score": self.score,
             "verdict": self.verdict,
+            "on_target_fraction": self.on_target_fraction,
+            "worst_offtarget_fraction": self.worst_offtarget_fraction,
+            "expression_evaluated": self.expression_evaluated,
+            "expression_reason": self.expression_reason,
+            "expression_source": (self.expression.source if self.expression is not None
+                                  else ""),
+            "offtarget_expression": self.offtarget_expression,
+            "expression_caveat": (EXPRESSION_IS_UNCALIBRATED
+                                  if self.expression_evaluated else ""),
             "sites": [str(s) for s in self.pair_sites],
             "summary": self.summary(),
         }
@@ -848,6 +1044,7 @@ def screen_pair(left_seq: str, right_seq: str, backend: Backend | None = None,
                 min_aligned_nt: int = DEFAULT_MIN_ALIGNED_NT,
                 steps: tuple[thermo.Conditions, ...] = thermo.ALL_STEPS,
                 penalty_c: float = thermo.DEFAULT_MISMATCH_PENALTY_C,
+                expression: ExpressionTable | None = None,
                 **backend_kwargs) -> SpecificityReport:
     """Screen one split-probe footprint. Never raises for a missing database.
 
@@ -866,6 +1063,10 @@ def screen_pair(left_seq: str, right_seq: str, backend: Backend | None = None,
     screened against GENCODE finds its own target in ~8 isoforms, pairs them up,
     and reports its own gene as eight off-target sites. Matching is on the gene
     field parsed out of the reference name, case-insensitively.
+
+    `expression` weights each off-target gene by its abundance in the imaged
+    cell type -- see `expression`. It needs gene names in the reference, so on a
+    genome screen it is reported as not evaluated rather than silently ignored.
     """
     if backend is None:
         try:
@@ -943,4 +1144,7 @@ def screen_pair(left_seq: str, right_seq: str, backend: Backend | None = None,
         on_target=on_target, target_gene=target_gene or "", gene_aware=gene_aware,
         on_target_gene_hits=on_target_gene_hits,
         n_sites_before_collapse=n_before_collapse,
+        on_target_fraction=(thermo.min_fraction_bound(queries["left"], steps=steps)
+                            * thermo.min_fraction_bound(queries["right"], steps=steps)),
+        expression=expression,
     )
