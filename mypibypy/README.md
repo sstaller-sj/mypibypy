@@ -709,11 +709,31 @@ python -m mypibypy mcp           # stdio server; an MCP client launches this its
 | `status` | which systems / loci files are loaded, whether they are placeholders, which screens are configured, where workbooks go |
 | `list_targets` | every locus, fusion and RNA target in the loci file, with its id |
 | `design_target` | design and screen one target by id; tiling, spacing and channel are parameters |
-| `write_order` | write one order workbook for designs from this session; returns its path |
+| `decide_design` | resolve a design stopped at a decision point: `proceed`, `flag_for_review`, `fail`, `reduce_pairs` or `switch_system`, with a short reason; refused in any other state |
+| `write_order` | write one order workbook for designs that have **succeeded**; returns its path |
 
 Under MCP the client decides what to call and in what order, so the agent's fixed
-decision structure no longer applies. What each tool accepts and returns is the
-whole safety story, and the rules for that are enforced in code:
+decision structure no longer applies. The server puts it back with the same state
+machine the agent loop runs (`agent/states.py`): every design is a run with a
+state, `design_target` reports it, and a tool is refused unless the state allows
+it.
+
+- A design with a clean screen goes straight to `succeeded`. One with an
+  unscreened pair, a failing screen, a paralog-like arm or poor accessibility
+  stops in `decide` and says why. **Because no screen backend means every pair is
+  NOT SCREENED, a design made without one needs an explicit `decide_design`
+  `proceed` before it can be ordered.** The acceptance and the client's reason are
+  written into the run record and the workbook note.
+- `write_order` refuses any design not in `succeeded`; `decide_design` refuses any
+  design not in `decide`. A refused call changes nothing and charges nothing.
+- Revision is budgeted as in the loop: four designs per run, three relaxations,
+  then the run fails rather than loosening further. Only `reduce_pairs` and
+  `switch_system` are offered, because relaxing Tm/GC or widening the region
+  would change nothing in this pipeline; fusions allow neither.
+- Every transition lands in the run record, so a run's path can be replayed.
+
+What each tool accepts and returns is the rest of the safety story, enforced in
+code:
 
 - **No tool takes a sequence, a target or a path.** Targets are addressed by id
   from the loci file, so Claude cannot point the pipeline at a region,
