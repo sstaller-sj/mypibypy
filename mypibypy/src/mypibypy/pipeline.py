@@ -35,6 +35,8 @@ from .design import (
     select_tiled,
     tiled_names,
 )
+from .fold import PairFolding, pair_folding
+from .fold import not_evaluated as folding_not_evaluated
 from .loci import FusionJunction, Locus, RnaTarget
 from .sequence import fetch_sequence, fetch_transcript, mask_repeats, rmsk_hits
 from .specificity import Backend, SpecificityReport, not_screened, screen_pair
@@ -64,6 +66,9 @@ class DesignResult:
     pairs: list[ProbePair] = field(default_factory=list)
     pair_screens: list[SpecificityReport] = field(default_factory=list)
     pair_accessibility: list[AccessibilityResult] = field(default_factory=list)
+    #: Self-folding of each ordered pair's P1L/P1R, parallel to `pairs`. Empty
+    #: for results built by hand; `folding_at` then says it was not evaluated.
+    pair_folding: list[PairFolding] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.pairs:
@@ -76,6 +81,16 @@ class DesignResult:
     @property
     def best(self) -> Candidate:
         return self.candidates[0]
+
+    def folding_at(self, i: int) -> PairFolding:
+        """Probe self-folding for pair `i`, or an explicit not-evaluated."""
+        if i < len(self.pair_folding):
+            return self.pair_folding[i]
+        return folding_not_evaluated("probe folding not checked for this pair")
+
+    @property
+    def folding(self) -> PairFolding:
+        return self.folding_at(0)
 
     @property
     def n_pairs(self) -> int:
@@ -100,9 +115,18 @@ class DesignResult:
             yield pair, screen, access
 
 
+def _folding(pairs: list[ProbePair], check: bool) -> list[PairFolding]:
+    """Fold every ordered primary, or say per pair that it was not asked for."""
+    if not check:
+        return [folding_not_evaluated("probe-folding check not requested")
+                for _ in pairs]
+    return [pair_folding(p) for p in pairs]
+
+
 def design_locus(locus: Locus, top: int = 5, backend: Backend | None = None,
                  screen: bool = True, n_pairs: int = 1,
                  min_spacing: int = DEFAULT_MIN_SPACING_NT,
+                 check_folding: bool = True,
                  **screen_kwargs) -> DesignResult:
     """Design one locus end to end.
 
@@ -144,7 +168,8 @@ def design_locus(locus: Locus, top: int = 5, backend: Backend | None = None,
             screens.append(
                 not_screened("genome screen skipped by request (screen=False)"))
     return DesignResult(locus, system, seq, cands, pairs[0], rmsk, screens[0],
-                        pairs=pairs, pair_screens=screens)
+                        pairs=pairs, pair_screens=screens,
+                        pair_folding=_folding(pairs, check_folding))
 
 
 class FusionIsSinglePair(ValueError):
@@ -153,6 +178,7 @@ class FusionIsSinglePair(ValueError):
 
 def design_fusion(junction: FusionJunction, backend=None, screen: bool = True,
                   pad_assignment: str = PADS_DIRECT, n_pairs: int = 1,
+                  check_folding: bool = True,
                   **screen_kwargs) -> list[DesignResult]:
     """Design a fusion junction: one sense result and one antisense result.
 
@@ -228,7 +254,8 @@ def design_fusion(junction: FusionJunction, backend=None, screen: bool = True,
         else:
             spec = not_screened("genome screen skipped by request (screen=False)")
         results.append(DesignResult(locus, pair.system, junction.sequence,
-                                    [cand], pair, rmsk=[], specificity=spec))
+                                    [cand], pair, rmsk=[], specificity=spec,
+                                    pair_folding=_folding([pair], check_folding)))
     return results
 
 
@@ -265,6 +292,7 @@ def design_rna(target: RnaTarget, backend=None, screen: bool = True,
                accessibility_weight: float = DEFAULT_ACCESSIBILITY_WEIGHT,
                nucleation_nt: int = DEFAULT_NUCLEATION_NT,
                n_pairs: int = 1, min_spacing: int = DEFAULT_MIN_SPACING_NT,
+               check_folding: bool = True,
                **screen_kwargs) -> DesignResult:
     """Design a split-probe pair against a transcript.
 
@@ -333,8 +361,10 @@ def design_rna(target: RnaTarget, backend=None, screen: bool = True,
             spec = screen_pair(cand.left.seq, cand.right.seq, backend=backend,
                                target_gene=target.gene, **screen_kwargs)
             if also_genome_backend is not None:
+                genome_kwargs = {k: v for k, v in screen_kwargs.items()
+                                 if k != "expression"}
                 genome = screen_pair(cand.left.seq, cand.right.seq,
-                                     backend=also_genome_backend, **screen_kwargs)
+                                     backend=also_genome_backend, **genome_kwargs)
                 # Kept as a note rather than merged: the two screens answer
                 # different questions against different coordinate spaces, and
                 # averaging their verdicts would obscure both.
@@ -350,4 +380,5 @@ def design_rna(target: RnaTarget, backend=None, screen: bool = True,
     return DesignResult(locus, system, seq, cands, pairs[0], rmsk=[],
                         specificity=screens[0], accessibility=accesses[0],
                         pairs=pairs, pair_screens=screens,
-                        pair_accessibility=accesses)
+                        pair_accessibility=accesses,
+                        pair_folding=_folding(pairs, check_folding))

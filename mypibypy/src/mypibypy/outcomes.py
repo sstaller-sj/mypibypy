@@ -83,6 +83,12 @@ class DesignFacts:
     specificity_summary: str = ""
     crosshyb_summary: str = ""
     crosshyb_worst_bp: int | None = None
+    # Continuous numbers to calibrate against later. None when not computed.
+    on_target_fraction_bound: float | None = None
+    worst_offtarget_fraction_bound: float | None = None
+    expression_weighted: bool = False
+    probe_fold_min_dg: float | None = None
+    probe_fold_worst_paired: float | None = None
     is_fusion: bool = False
     arms_meet_at_junction: bool | None = None
     arm_separation_nt: int | None = None
@@ -128,6 +134,11 @@ class Outcome:
 
 # --- Building a record from a design ---------------------------------------
 
+def _number(x: float) -> float | None:
+    """NaN means "not computed"; store it as None so JSON round-trips it."""
+    return None if x is None or x != x else float(x)
+
+
 def facts_from_result(result, design_id: str | None = None,
                       crosshyb_report=None) -> DesignFacts:
     """Flatten a `pipeline.DesignResult` into storable facts.
@@ -153,6 +164,11 @@ def facts_from_result(result, design_id: str | None = None,
         specificity_summary=spec.summary(),
         crosshyb_summary=crosshyb_report.summary() if crosshyb_report is not None else "",
         crosshyb_worst_bp=worst.duplex.length if worst is not None else None,
+        on_target_fraction_bound=_number(spec.on_target_fraction),
+        worst_offtarget_fraction_bound=_number(spec.worst_offtarget_fraction),
+        expression_weighted=spec.expression_evaluated,
+        probe_fold_min_dg=result.folding.min_dg,
+        probe_fold_worst_paired=result.folding.worst_paired,
         is_fusion="junction" in str(cand.interval),
     )
 

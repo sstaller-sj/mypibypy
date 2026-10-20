@@ -11,6 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .expression import EXPRESSION_IS_UNCALIBRATED
 from .pipeline import DesignResult
 
 FONT = "Arial"
@@ -67,7 +68,19 @@ def _specificity_text(rep) -> str:
         text += f"\n  - {site}"
     if len(rep.pair_sites) > 5:
         text += f"\n  - ... and {len(rep.pair_sites) - 5} more"
+    if rep.expression_evaluated:
+        text += f"\n{EXPRESSION_IS_UNCALIBRATED}"
     return text
+
+
+def _folding_text(fold) -> str:
+    """One cell for probe self-folding, including it not having been run."""
+    return fold.summary()
+
+
+def _folding_flagged(fold) -> bool:
+    """Worth a reader's eye -- a word for a colour, not a reject."""
+    return fold.evaluated and fold.limiting.label == "folded"
 
 
 def _accessibility_text(res) -> str:
@@ -199,6 +212,33 @@ def _notes_sheet(wb, results, source_note):
             r += 1
         r += 1
 
+    if any(res.folding_at(i).evaluated for res in results for i in range(res.n_pairs)):
+        ws.cell(row=r, column=1, value="Probe folding").font = H
+        ws.cell(row=r, column=2, value=(
+            "Self-folding of each synthesized P1L/P1R (RNAfold partition function, "
+            "DNA parameters, primary-hyb conditions): mean probability that a pad "
+            "base and an arm base is paired, with the MFE as context. The more "
+            "folded primary per pair is shown. At 6x SSC random sequence is ~40% "
+            "paired, so 'open' runs to 50%; the words are not thresholds."
+        )).font = B
+        ws.cell(row=r, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+        r += 1
+        for res in results:
+            L = res.locus
+            for i in range(res.n_pairs):
+                fold = res.folding_at(i)
+                label = f"  {L.gene} {L.name}" + (f" #{i + 1}" if res.tiled else "")
+                ws.cell(row=r, column=1, value=label).font = B
+                cell = ws.cell(row=r, column=2, value=(
+                    str(fold.limiting) if fold.evaluated
+                    else f"NOT EVALUATED -- {fold.reason}"))
+                cell.font = B
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+                if _folding_flagged(fold):
+                    cell.fill = WARN_FILL
+                r += 1
+        r += 1
+
     ws.cell(row=r, column=1, value="Source/provenance").font = H
     ws.cell(row=r, column=2, value=source_note).font = B
     ws.cell(row=r, column=2).alignment = Alignment(wrap_text=True, vertical="top")
@@ -281,9 +321,10 @@ def _tiled_locus_sheet(wb, res):
 
     headers = ["#", "Footprint", "left25 (plus)", "gap", "right25 (plus)",
                "GC L/R", "Tm L/R", "QC flags", "P1L name", "P1L sequence",
-               "P1R name", "P1R sequence", "Genome screen", "Accessibility"]
+               "P1R name", "P1R sequence", "Genome screen", "Accessibility",
+               "Probe folding"]
     _hdr(ws, 4, headers,
-         widths=[4, 26, 27, 5, 27, 11, 13, 24, 22, 52, 22, 52, 46, 46])
+         widths=[4, 26, 27, 5, 27, 11, 13, 24, 22, 52, 22, 52, 46, 46, 46])
     r = 5
     for i, (pair, screen, access) in enumerate(res.rows(), start=1):
         cand = pair.candidate
@@ -294,6 +335,7 @@ def _tiled_locus_sheet(wb, res):
             ", ".join(cand.flags) or "none",
             pair.p1l_name, pair.p1l, pair.p1r_name, pair.p1r,
             _specificity_text(screen), _accessibility_text(access),
+            _folding_text(res.folding_at(i - 1)),
         ]
         for j, v in enumerate(values, start=1):
             cell = ws.cell(row=r, column=j, value=v)
@@ -305,6 +347,8 @@ def _tiled_locus_sheet(wb, res):
             ws.cell(row=r, column=13).fill = WARN_FILL
         if access.evaluated and access.pair_nucleation_p < 0.2:
             ws.cell(row=r, column=14).fill = WARN_FILL
+        if _folding_flagged(res.folding_at(i - 1)):
+            ws.cell(row=r, column=15).fill = WARN_FILL
         r += 1
     ws.freeze_panes = "B5"
     r += 1
@@ -338,6 +382,7 @@ def _locus_sheet(wb, res):
     kv(12, "QC flags", ", ".join(c.flags) or "none")
     kv(13, "Genome screen", _specificity_text(res.specificity))
     kv(14, "Target-site accessibility", _accessibility_text(res.accessibility))
+    kv(15, "Probe self-folding", _folding_text(res.folding))
     kv(16, p.p1l_name, p.p1l, mono=True)
     kv(17, p.p1r_name, p.p1r, mono=True)
     kv(19, "Region sequence (plus, 5'->3')", res.region_seq, mono=True)

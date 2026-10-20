@@ -21,6 +21,7 @@ import argparse
 import re
 
 from .design import DEFAULT_MIN_SPACING_NT, PADS_AS_ORDERED, PADS_DIRECT
+from .expression import ENV_EXPRESSION, resolve_expression
 from .loci import (
     Locus,
     is_example,
@@ -60,6 +61,10 @@ def _report(results):
             print(f"  {pair.p1l_name}: {pair.p1l}")
             print(f"  {pair.p1r_name}: {pair.p1r}")
             print(f"    specificity: {screen.summary()}")
+        for i in range(res.n_pairs):
+            fold = res.folding_at(i)
+            if fold.evaluated:
+                print(f"    probe folding: {fold.limiting}")
         if res.accessibility.evaluated:
             print(f"  accessibility: {res.accessibility.summary()}")
 
@@ -175,6 +180,12 @@ def main(argv=None):
                         "and the probe cannot invade it")
     r.add_argument("--no-screen", action="store_true",
                    help="skip the specificity screen entirely")
+    r.add_argument("--expression", metavar="TSV",
+                   help=f"per-gene TPM in the imaged cell type (gene/TPM table, "
+                        f"RSEM genes.results or salmon quant.sf), used to weight "
+                        f"off-target genes by abundance (default: "
+                        f"${ENV_EXPRESSION}; without one, weighting is reported "
+                        f"as not evaluated)")
     _tiling_options(r)
 
     d = sub.add_parser("design", help="design one locus given on the command line")
@@ -214,13 +225,24 @@ def main(argv=None):
                 print(f"WARNING: no transcriptome screen will be run -- {exc}")
             if args.also_genome_index:
                 genome_backend = resolve_backend(bowtie_index=args.also_genome_index)
+        try:
+            expression = resolve_expression(args.expression)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"could not load expression table: {exc}")
+        if expression is None:
+            warnings.append("no expression table given (--expression or "
+                            f"${ENV_EXPRESSION}); off-target genes are not "
+                            "weighted by abundance")
         results = [design_rna(t, backend=backend, screen=not args.no_screen,
                               also_genome_backend=genome_backend,
-                              n_pairs=args.pairs, min_spacing=args.min_spacing)
+                              n_pairs=args.pairs, min_spacing=args.min_spacing,
+                              expression=expression)
                    for t in targets]
         note = (f"mypibypy RNA design of {len(targets)} transcript target(s) from "
                 f"{resolve_loci_path(args.loci).name}. Screened against a "
-                f"transcriptome; see pipeline.RNA_SCREEN_POLICY.")
+                f"transcriptome; see pipeline.RNA_SCREEN_POLICY."
+                + (f" Off-target genes weighted by expression from "
+                   f"{expression.describe()}." if expression is not None else ""))
     elif args.cmd == "fusion":
         fusions = load_fusions(args.loci)
         if not fusions:
