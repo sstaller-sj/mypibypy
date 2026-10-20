@@ -471,8 +471,11 @@ def build_client(kind: str | None = None, **kwargs) -> DecisionClient | None:
         return OllamaDecisionClient(**kwargs)
     if kind in ("anthropic", "claude", "api"):
         return AnthropicDecisionClient(**kwargs)
+    if kind in ("pydantic_ai", "pydantic-ai", "pydanticai"):
+        from .pydantic_ai_client import PydanticAIDecisionClient
+        return PydanticAIDecisionClient(**kwargs)
     if kind == "scripted":
         return ScriptedClient(**kwargs)
     raise ValueError(
         f"unknown decision client {kind!r}; choose from ollama, anthropic, "
-        f"scripted, none")
+        f"pydantic_ai, scripted, none")

@@ -265,7 +265,7 @@ class TestBuildClient:
         assert isinstance(client, AnthropicDecisionClient)
 
     def test_an_unknown_kind_is_refused_with_the_options(self):
-        with pytest.raises(ValueError, match="ollama, anthropic, scripted, none"):
+        with pytest.raises(ValueError, match="ollama, anthropic, pydantic_ai, scripted, none"):
             build_client("telepathy")
 
     def test_host_and_model_come_from_env(self, monkeypatch):

@@ -550,6 +550,15 @@ What the model may say is `agent/models.py:DecisionModel` — closed keys, the
 contains an oligo-length run of bases. `Decision.from_payload` applies it to
 every client; `test_models.py` pins it to the hand-written `ACTION_SCHEMA`.
 
+**A PydanticAI client** (`MYPIBYPY_DECISION_CLIENT=pydantic_ai`, install with
+`pip install -e ".[pydantic-ai]"`) sits behind the same `DecisionClient` seam. It
+gets validate-and-retry for free, bounded by `max_attempts`, and never raises.
+It reaches Ollama over `/v1`, where `think` is ignored but
+`reasoning_effort: "none"` works. Measured on qwen3.5:9b, same evidence, same
+decision: **~9 s against ~6.5 s** for the native client (twice the output
+tokens), so the native client stays the default. The `num_ctx` cap does not
+apply on `/v1`.
+
 **`think: false` is mandatory, and measured.** qwen3.5 is a thinking model;
 left alone it spends its budget reasoning instead of answering. On one identical
 prompt, warm:

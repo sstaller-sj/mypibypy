@@ -22,6 +22,9 @@ dependencies = ["openpyxl>=3.1", "biopython>=1.80", "pydantic>=2.5"]
 dev = ["pytest>=8"]
 # The MCP server (`python -m mypibypy mcp`). Only that subcommand imports it.
 mcp = ["mcp>=2.3"]
+# The PydanticAI decision client (`MYPIBYPY_DECISION_CLIENT=pydantic_ai`). Lazy
+# import: nothing else needs it.
+pydantic-ai = ["pydantic-ai-slim[openai]>=2.58"]
 
 [project.scripts]
 mypibypy = "mypibypy.cli:main"
