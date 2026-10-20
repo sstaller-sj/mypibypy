@@ -20,7 +20,20 @@ from mypibypy.pipeline import DesignResult
 from mypibypy.sequence import GenomicInterval
 from mypibypy.specificity import SCREENED, SpecificityReport, not_screened
 from mypibypy.systems import systems
-from mypibypy.ui import candidate_rows, unscreened_pairs, workbook_bytes
+from mypibypy.expression import ExpressionTable
+from mypibypy.fold import EVALUATED as FOLD_EVALUATED
+from mypibypy.fold import OligoFold, PairFolding
+from mypibypy.specificity import Hit, PairSite
+from mypibypy.ui import (
+    candidate_rows,
+    expression_status,
+    folding_cell,
+    folding_details,
+    on_target_cell,
+    unscreened_pairs,
+    workbook_bytes,
+    worst_offtarget_cell,
+)
 
 
 @pytest.fixture(scope="module")
@@ -30,14 +43,17 @@ def system():
     return list(reg.values())[0]
 
 
-def make_result(system, n_pairs=1, screened=False, accessibility=None):
+def make_result(system, n_pairs=1, screened=False, accessibility=None,
+                screens=None, folding=None):
     rng = random.Random(77)
     seq = "".join(rng.choice("ACGT") for _ in range(600))
     iv = GenomicInterval("hg38", "chr1", 1, 600)
     locus = Locus("target", "GENE", "ui test", iv, system.name)
     cands = scan(seq, iv, top=len(seq))
     pairs = build_tiled_pairs("target", "GENE", system, select_tiled(cands, n_pairs))
-    if screened:
+    if screens is not None:
+        screens = [screens[i % len(screens)] for i in range(len(pairs))]
+    elif screened:
         screens = [SpecificityReport(status=SCREENED, backend="bowtie v1 -v 3 -a",
                                      database="hg38") for _ in pairs]
     else:
@@ -45,7 +61,8 @@ def make_result(system, n_pairs=1, screened=False, accessibility=None):
     access = [accessibility or _not_evaluated() for _ in pairs]
     return DesignResult(locus, system, seq, cands[:5], pairs[0], [], screens[0],
                         accessibility=access[0], pairs=pairs,
-                        pair_screens=screens, pair_accessibility=access)
+                        pair_screens=screens, pair_accessibility=access,
+                        pair_folding=list(folding or []))
 
 
 def _not_evaluated():
@@ -122,3 +139,121 @@ class TestWorkbookBytes:
     def test_tiled_results_render(self, system):
         data = workbook_bytes([make_result(system, n_pairs=5)], "tiled")
         assert data[:2] == b"PK"
+
+
+# --- self-folding, P(bound), expression weighting --------------------------
+
+def _hit(query, start, gene):
+    return Hit(query=query, chrom=f"tx|{gene}", start=start, end=start + 24,
+               strand="+", mismatches=0, gaps=0, aligned=25, query_len=25,
+               q_start=1, q_end=25, gene=gene)
+
+
+def _site(gene, fraction=float("nan"), signal_capable=True):
+    return PairSite(chrom=f"tx|{gene}", left=_hit("left", 100, gene),
+                    right=_hit("right", 126, gene), gap_nt=1,
+                    same_strand=signal_capable, correct_order=True,
+                    survives_wash=True, min_margin_c=10.0, gene=gene,
+                    left_fraction=fraction, right_fraction=1.0)
+
+
+def _screened(sites=(), on_target=float("nan"), expression=None, gene_aware=True):
+    return SpecificityReport(status=SCREENED, backend="bowtie", database="tx",
+                             gene_aware=gene_aware, pair_sites=list(sites),
+                             on_target_fraction=on_target, expression=expression)
+
+
+def _folding(pad_structure):
+    def oligo(name):
+        return OligoFold(name, "N" * 10, -2.0, pad_structure, pad=(0, 10),
+                         arm=(0, 0))
+    return PairFolding(status=FOLD_EVALUATED, p1l=oligo("P1L"), p1r=oligo("P1R"),
+                       tool="RNAfold", temp_c=37.0, salt_m=0.39)
+
+
+class TestFolding:
+    def test_unevaluated_folding_says_so_in_words(self, system):
+        result = make_result(system)
+        assert candidate_rows(result)[0]["self-folding"] == "not evaluated"
+        assert "NOT EVALUATED" in folding_details(result)[0]
+
+    def test_evaluated_folding_shows_the_limiting_label(self, system):
+        result = make_result(system, folding=[_folding("((((..))))")])
+        assert candidate_rows(result)[0]["self-folding"] == "folded"
+        assert folding_cell(_folding("..........")) == "open"
+
+    def test_details_cover_every_pair_and_carry_the_caveat(self, system):
+        result = make_result(system, n_pairs=3, folding=[_folding("((((..))))")])
+        lines = folding_details(result)
+        assert len(lines) == 3
+        assert lines[0].startswith("Pair 1: FOLDED")
+        assert "UNCALIBRATED" in lines[0].upper()
+        assert "NOT EVALUATED" in lines[1], "missing pairs must not borrow pair 1's"
+
+
+class TestFractionBound:
+    def test_unscreened_says_not_screened(self):
+        screen = not_screened("no index")
+        assert on_target_cell(screen) == "NOT SCREENED"
+        assert worst_offtarget_cell(screen) == "NOT SCREENED"
+
+    def test_nan_means_not_computed_never_a_number(self):
+        screen = _screened(sites=[_site("OTHER")])
+        assert on_target_cell(screen) == "not computed"
+        assert worst_offtarget_cell(screen) == "not computed"
+
+    def test_no_off_target_site_is_said_in_words(self):
+        assert worst_offtarget_cell(_screened(on_target=0.9)) == "no off-target site"
+
+    def test_a_site_that_cannot_signal_does_not_set_the_worst(self):
+        screen = _screened(sites=[_site("OTHER", 0.5, signal_capable=False)])
+        assert worst_offtarget_cell(screen) == "no off-target site"
+
+    def test_values_keep_significant_figures(self):
+        """A tiny occupancy rounded to fixed decimals would print as 0."""
+        screen = _screened(sites=[_site("A", 3e-5), _site("B", 0.004)],
+                           on_target=0.97)
+        assert on_target_cell(screen) == "0.97"
+        assert worst_offtarget_cell(screen) == "0.004"
+        assert worst_offtarget_cell(_screened(sites=[_site("A", 3e-5)])) == "3e-05"
+
+    def test_columns_are_in_the_table(self, system):
+        row = candidate_rows(make_result(system))[0]
+        assert row["on-target P(bound)"] == "NOT SCREENED"
+        assert row["worst off-target P(bound)"] == "NOT SCREENED"
+
+
+TABLE = ExpressionTable("cells.tsv", {"other": 5.0})
+
+
+class TestExpressionStatus:
+    def test_unscreened_is_not_evaluated_with_reason(self, system):
+        weighted, text = expression_status(make_result(system))
+        assert not weighted
+        assert "NOT EVALUATED" in text and "no screen was run" in text
+
+    def test_no_table_is_not_evaluated(self, system):
+        weighted, text = expression_status(
+            make_result(system, screens=[_screened()]))
+        assert not weighted
+        assert "no expression table supplied" in text
+
+    def test_genome_screen_cannot_be_weighted(self, system):
+        weighted, text = expression_status(
+            make_result(system, screens=[_screened(expression=TABLE,
+                                                   gene_aware=False)]))
+        assert not weighted
+        assert "gene names" in text
+
+    def test_weighted_names_the_source_and_the_caveat(self, system):
+        weighted, text = expression_status(
+            make_result(system, n_pairs=2, screens=[_screened(expression=TABLE)]))
+        assert weighted
+        assert "cells.tsv" in text and "UNCALIBRATED" in text
+
+    def test_partial_weighting_is_not_a_pass(self, system):
+        result = make_result(system, n_pairs=2,
+                             screens=[_screened(expression=TABLE), _screened()])
+        weighted, text = expression_status(result)
+        assert not weighted
+        assert "1 of 2 pair(s)" in text

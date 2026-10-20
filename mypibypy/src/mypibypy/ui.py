@@ -7,19 +7,21 @@ that turns a `DesignResult` into rows and bytes.
 """
 from __future__ import annotations
 
+import math
 import tempfile
 from pathlib import Path
 
+from .expression import EXPRESSION_IS_UNCALIBRATED
 from .workbook import write_workbook
 
 
 def candidate_rows(result) -> list[dict]:
     """One row per ordered pair: composition, thermodynamics, and both screens.
 
-    `accessibility` and `specificity` render the *absence* of a result as words
-    rather than as a blank or a zero -- "not evaluated" and "NOT SCREENED" --
-    because a table cell is exactly where a missing screen would otherwise look
-    like a passing one.
+    `accessibility`, `specificity`, `self-folding` and the two P(bound) columns
+    render the *absence* of a result as words rather than as a blank or a zero
+    -- "not evaluated", "NOT SCREENED", "not computed" -- because a table cell
+    is exactly where a missing screen would otherwise look like a passing one.
     """
     rows = []
     for i, (pair, screen, access) in enumerate(result.rows(), start=1):
@@ -34,6 +36,9 @@ def candidate_rows(result) -> list[dict]:
             "accessibility": (round(access.pair_nucleation_p, 3)
                               if access.evaluated else "not evaluated"),
             "specificity": screen.verdict if screen.screened else "NOT SCREENED",
+            "on-target P(bound)": on_target_cell(screen),
+            "worst off-target P(bound)": worst_offtarget_cell(screen),
+            "self-folding": folding_cell(result.folding_at(i - 1)),
             "off-target genes": ", ".join(screen.offtarget_genes[:4]) or "-",
             "QC flags": ", ".join(cand.flags) or "none",
             "P1L": pair.p1l_name,
@@ -57,3 +62,67 @@ def workbook_bytes(results, note: str) -> bytes:
 def unscreened_pairs(result) -> int:
     """How many ordered pairs have no specificity result. Drives the UI warning."""
     return sum(1 for screen in result.pair_screens if not screen.screened)
+
+
+def folding_cell(fold) -> str:
+    """The limiting primary's folding word, or "not evaluated"."""
+    return fold.limiting.label if fold.evaluated else "not evaluated"
+
+
+def folding_details(result) -> list[str]:
+    """One line per ordered pair: the full self-folding summary, caveat included."""
+    return [f"Pair {i + 1}: {result.folding_at(i).summary()}"
+            for i in range(result.n_pairs)]
+
+
+def _fraction(x: float) -> str:
+    # Two significant figures, not rounding to a fixed place: an occupancy of
+    # 3e-5 rounded to three decimals would print as 0.0 and read as "none".
+    return f"{x:.2g}"
+
+
+def on_target_cell(screen) -> str:
+    """On-target equilibrium fraction bound, or why there is none."""
+    if not screen.screened:
+        return "NOT SCREENED"
+    if math.isnan(screen.on_target_fraction):
+        return "not computed"
+    return _fraction(screen.on_target_fraction)
+
+
+
+def worst_offtarget_cell(screen) -> str:
+    """Highest off-target fraction bound among signal-capable sites.
+
+    NaN has two meanings here and they must not be conflated: a screen that
+    found no signal-capable site has nothing to price, while one that found
+    sites but priced none did not compute the number.
+    """
+    if not screen.screened:
+        return "NOT SCREENED"
+    worst = screen.worst_offtarget_fraction
+    if not math.isnan(worst):
+        return _fraction(worst)
+    if not screen.signal_capable_sites:
+        return "no off-target site"
+    return "not computed"
+
+
+def expression_status(result) -> tuple[bool, str]:
+    """(weighted?, sentence) for expression weighting across a result's pairs.
+
+    Only "weighted" when every ordered pair was; otherwise the sentence says
+    weighting was NOT EVALUATED and why, so a partial weighting cannot pass for
+    a complete one.
+    """
+    screens = [screen for _, screen, _ in result.rows()]
+    missing = [s for s in screens if not s.expression_evaluated]
+    if not missing:
+        source = screens[0].expression.source
+        return True, (f"Off-target genes weighted by expression from `{source}`. "
+                      f"Note: {EXPRESSION_IS_UNCALIBRATED}.")
+    reasons = sorted({s.expression_reason for s in missing})
+    scope = ("" if len(missing) == len(screens)
+             else f" for {len(missing)} of {len(screens)} pair(s)")
+    return False, (f"Expression weighting NOT EVALUATED{scope} — "
+                   f"{'; '.join(reasons)}.")

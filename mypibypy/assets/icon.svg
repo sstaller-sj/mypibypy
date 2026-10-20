@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>mypibypy: two probes, legs side by side, annealed to a target strand</title>
+  <rect width="512" height="512" rx="112" fill="#12372a"/>
+  <!-- inverted pi -->
+  <path fill="#b7e4c7" transform="translate(392.6 23.1) scale(-0.255 0.255)" d="M993 916V770H761L741 466Q735 387 735 329Q735 190 767.5 159.5Q800 129 846 129Q942 129 960 250H996Q963 -28 774 -28Q686 -28 632.5 26.0Q579 80 579 186Q579 256 600 482L627 770H415Q394 406 364.5 238.0Q335 70 299.5 21.0Q264 -28 203 -28Q157 -28 125.5 -1.0Q94 26 94 70Q94 112 148 185Q227 291 266.0 405.5Q305 520 325 770H257Q175 770 131.5 733.5Q88 697 49 629H13Q42 736 88.0 805.0Q134 874 182.5 895.0Q231 916 355 916Z"/>
+  <!-- base pairs: pi to the probes' top bars -->
+  <path stroke="#74c69d" stroke-width="5" stroke-linecap="round" d="M165.0 260 V272 M182.5 260 V272 M200.0 260 V272 M217.5 260 V272 M235.0 260 V272 M266.0 260 V272 M283.5 260 V272 M301.0 260 V272 M318.5 260 V272 M336.0 260 V272"/>
+  <g transform="translate(97.3 209.9) scale(0.62)">
+  <!-- probes: each is a bracket with its tail lying along the target -->
+  <g fill="#b7e4c7">
+    <polygon points="96,105 239,105 239,343 66,343 66,317 213,317 213,131 96,131"/>
+    <polygon points="416,105 273,105 273,343 446,343 446,317 299,317 299,131 416,131"/>
+  </g>
+  <!-- base pairs between probe tails and target -->
+  <g stroke="#74c69d" stroke-width="8" stroke-linecap="round">
+    <path d="M84 348 V382 M112 348 V382 M140 348 V382 M168 348 V382 M196 348 V382"/>
+    <path d="M316 348 V382 M344 348 V382 M372 348 V382 M400 348 V382 M428 348 V382"/>
+  </g>
+  <!-- target strand -->
+  <rect x="66" y="384" width="380" height="26" fill="#52b788"/>
+  </g>
+</svg>

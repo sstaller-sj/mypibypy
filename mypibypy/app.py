@@ -52,9 +52,17 @@ from mypibypy.pipeline import design_fusion, design_locus, design_rna
 from mypibypy.sequence import GenomicInterval, fetch_sequence, fetch_transcript
 from mypibypy.specificity import Backend, resolve_backend, SpecificityNotConfigured
 from mypibypy.systems import is_example, resolve_systems_path, systems
-from mypibypy.ui import candidate_rows, unscreened_pairs, workbook_bytes
+from mypibypy.expression import ENV_EXPRESSION, load_expression
+from mypibypy.ui import (
+    candidate_rows,
+    expression_status,
+    folding_details,
+    unscreened_pairs,
+    workbook_bytes,
+)
 
-st.set_page_config(page_title="mypibypy", page_icon="🧬", layout="wide")
+ICON_PATH = Path(__file__).parent / "assets" / "icon.png"
+st.set_page_config(page_title="mypibypy", page_icon=str(ICON_PATH), layout="wide")
 
 
 # --- cached resources ------------------------------------------------------
@@ -81,6 +89,12 @@ def screening_backend(index: str) -> Backend | None:
 def cached_region(build: str, chrom: str, start: int, end: int) -> str:
     """Memory-only. Never persist=\"disk\": that writes target sequence to disk."""
     return fetch_sequence(GenomicInterval(build, chrom, start, end))
+
+
+@st.cache_resource(show_spinner="Loading expression table…")
+def cached_expression(path: str):
+    """A resource: the parsed table is held, and it carries no sequence."""
+    return load_expression(path)
 
 
 @st.cache_data(show_spinner="Fetching transcript…")
@@ -310,73 +324,94 @@ def show_run_record(record) -> None:
         st.json(record.to_dict())
 
 
-# --- sidebar ---------------------------------------------------------------
-
-st.sidebar.title("🧬 mypibypy")
-st.sidebar.caption("piFISH split-probe design")
+# --- sidebar: settings you set once and rarely touch ------------------------
 
 reg = registry()
-# `loaded_from()` reports only what is currently cached, and Streamlit can
-# re-import the module on a hot reload while `registry()` stays cached -- which
-# showed "systems: None" even though the real file was loaded. Resolve the path
-# directly so the caption always names the file that would be used.
-st.sidebar.caption(f"systems: `{resolve_systems_path()}`")
-if is_example():
-    st.sidebar.error(
-        f"Amplifier systems are the SYNTHETIC EXAMPLES "
-        f"({resolve_systems_path().name}). "
-        "Probes designed now are **not orderable** — see the README on "
-        "systems.local.json."
-    )
 
-interface = st.sidebar.radio("Interface", ["Form", "Chat"], horizontal=True)
-mode = st.sidebar.radio("Target type", ["Genomic region", "RNA transcript",
-                                        "Fusion junction"],
-                        disabled=interface == "Chat",
-                        help="In Chat the target comes from what you type.")
-system_key = st.sidebar.selectbox("Amplifier system", sorted(reg),
-                                  format_func=lambda k: f"{k} ({reg[k].fluorophore})")
-
-if mode == "Fusion junction":
-    st.sidebar.caption("A junction is one position — the gap sits on the "
-                       "breakpoint — so tiling does not apply.")
-    n_pairs, min_spacing = 1, DEFAULT_MIN_SPACING_NT
-else:
-    n_pairs = st.sidebar.number_input("Pairs to tile", 1, 50, 1)
-    min_spacing = st.sidebar.number_input("Minimum spacing (nt)", 0, 5000,
-                                         DEFAULT_MIN_SPACING_NT)
-
-index_path = st.sidebar.text_input(
-    "bowtie index (optional)",
-    help="Leave blank to skip the genome/transcriptome screen. The workbook "
-         "will then say in writing that no screen was run.")
-use_agent = st.sidebar.checkbox(
-    "Run through the agent loop", value=False, disabled=interface == "Chat",
-    help="Adds the deterministic classifier and, for genuinely conflicting "
-         "signals, a model decision. Clear cases are settled without a model.")
-client_kind = st.sidebar.selectbox(
-    "Decision model", ["ollama", "none", "anthropic"], index=0,
-    help="Local model by default. 'none' runs the pipeline with no model at "
-         "all, flagging anything that would need a judgement call.")
+with st.sidebar:
+    _icon_col, _title_col = st.columns([1, 3], vertical_alignment="center")
+    _icon_col.image(str(ICON_PATH))
+    _title_col.title("mypibypy")
+    st.caption("piFISH split-probe design")
+    st.subheader("Advanced")
+    index_path = st.text_input(
+        "bowtie index (optional)",
+        help="Leave blank to skip the genome/transcriptome screen. The workbook "
+             "will then say in writing that no screen was run.")
+    client_kind = st.selectbox(
+        "Decision model", ["ollama", "none", "anthropic"], index=0,
+        help="Local model by default. 'none' runs the pipeline with no model at "
+             "all, flagging anything that would need a judgement call.")
+    use_agent = st.checkbox(
+        "Run through the agent loop", value=False,
+        help="Adds the deterministic classifier and, for genuinely conflicting "
+             "signals, a model decision. Clear cases are settled without a "
+             "model. Form only.")
+    # `loaded_from()` reports only what is currently cached, and Streamlit can
+    # re-import the module on a hot reload while `registry()` stays cached --
+    # which showed "systems: None" even though the real file was loaded. Resolve
+    # the path directly so the caption always names the file that would be used.
+    st.caption(f"Amplifier systems file: `{resolve_systems_path()}`")
 
 # --- main ------------------------------------------------------------------
 
 st.title("Design piFISH probes")
+if is_example():
+    st.error(
+        f"Amplifier systems are the SYNTHETIC EXAMPLES "
+        f"({resolve_systems_path().name}). Probes designed now are **not "
+        "orderable** — see the README on systems.local.json.")
+
 backend = screening_backend(index_path.strip())
-results, note = [], ""
+if backend is None:
+    st.info("**No specificity screen will run.** Add a bowtie index under "
+            "*Advanced* in the sidebar to screen for off-target binding.",
+            icon="⚠️")
+
+interface = st.radio("How do you want to work?",
+                     ["Form", "Chat"], horizontal=True,
+                     captions=["Fill in a target and settings",
+                               "Describe what you want in plain language"])
+
+# Settings shared by both interfaces.
+st.subheader("1 · Amplifier channel")
+system_key = st.selectbox("Amplifier system", sorted(reg),
+                          format_func=lambda k: f"{k} ({reg[k].fluorophore})")
 
 if interface == "Chat":
+    st.divider()
+    st.subheader("2 · Chat")
     chat_panel(backend, system_key, client_kind, sorted(reg))
     st.stop()
 
+st.subheader("2 · Target")
+mode = st.radio("Target type", ["Genomic region", "RNA transcript",
+                                "Fusion junction"], horizontal=True,
+                label_visibility="collapsed")
+run = {}   # what a click on Design produced; stored so it survives reruns
+
+if mode == "Fusion junction":
+    n_pairs, min_spacing = 1, DEFAULT_MIN_SPACING_NT
+else:
+    c1, c2 = st.columns(2)
+    n_pairs = c1.number_input(
+        "Pairs to tile", 1, 50, 1,
+        help="Adjacent probe pairs along the target; more pairs, more signal.")
+    min_spacing = c2.number_input(
+        "Minimum spacing (nt)", 0, 5000, DEFAULT_MIN_SPACING_NT,
+        help="Gap kept between neighbouring pairs.")
+
 if mode == "Genomic region":
     col1, col2 = st.columns([2, 3])
-    build = col1.text_input("Build", "hg38")
+    build = col1.text_input("Genome build", "hg38")
     region = col2.text_input("Region (chrom:start-end)", "",
                              placeholder="chr5:142906255-142906754")
-    gene = col1.text_input("Gene label", "GENE")
-    name = col2.text_input("Target name", "target")
-    if st.button("Design", type="primary", disabled=not region):
+    with st.expander("Labels (optional)"):
+        lc1, lc2 = st.columns(2)
+        gene = lc1.text_input("Gene label", "GENE")
+        name = lc2.text_input("Target name", "target")
+    clicked = st.button("Design probes", type="primary", disabled=not region)
+    if clicked:
         try:
             chrom, span = region.split(":")
             start, end = (int(x.replace(",", "")) for x in span.split("-"))
@@ -390,29 +425,50 @@ if mode == "Genomic region":
                              screen=backend is not None, n_pairs=int(n_pairs),
                              min_spacing=int(min_spacing))
         if one is not None:
-            results = [one]
-            note = f"mypibypy UI: {locus.interval}, system {system_key}."
+            run = dict(results=[one], mode=mode,
+                       note=f"mypibypy UI: {locus.interval}, system {system_key}.")
 
 elif mode == "RNA transcript":
-    accession = st.text_input("Accession", "", placeholder="NM_000546.6 or ENST…")
-    gene = st.text_input("Gene symbol", "", placeholder="used to exclude on-target hits")
+    c1, c2 = st.columns(2)
+    accession = c1.text_input("Accession", "", placeholder="NM_000546.6 or ENST…")
+    gene = c2.text_input("Gene symbol", "", placeholder="TP53",
+                         help="Used to exclude on-target hits from the screen.")
+    expression_path = st.text_input(
+        "Expression table (optional)", os.environ.get(ENV_EXPRESSION, ""),
+        placeholder="TPM table for the imaged cell type (.tsv)",
+        help="Weights each off-target gene by its abundance. Leave blank and "
+             "the results will say weighting was not evaluated.")
     st.caption("Screened against a **transcriptome** index — see "
                "`pipeline.RNA_SCREEN_POLICY` for why, and why a junction-spanning "
                "footprint does not map contiguously to a genome.")
-    if st.button("Design", type="primary", disabled=not (accession and gene)):
+    clicked = st.button("Design probes", type="primary",
+                        disabled=not (accession and gene))
+    if clicked:
         from mypibypy.loci import RnaTarget
         target = RnaTarget("target", gene, accession.strip(), system_key)
-        with st.spinner("Fetching and designing…"):
-            seq = run_design(cached_transcript, accession.strip())
-            one = run_design(design_rna, target, backend=backend,
-                             screen=backend is not None, transcript_seq=seq,
-                             n_pairs=int(n_pairs),
-                             min_spacing=int(min_spacing)) if seq else None
+        expression, seq, one = None, None, None
+        if expression_path.strip():
+            try:
+                expression = cached_expression(expression_path.strip())
+            except (OSError, ValueError) as exc:
+                st.error(f"**Could not load the expression table.** {exc}")
+                expression = False
+        if expression is not False:
+            with st.spinner("Fetching and designing…"):
+                seq = run_design(cached_transcript, accession.strip())
+                one = run_design(design_rna, target, backend=backend,
+                                 screen=backend is not None, transcript_seq=seq,
+                                 n_pairs=int(n_pairs),
+                                 min_spacing=int(min_spacing),
+                                 expression=expression) if seq else None
         if one is not None:
-            results = [one]
-            note = f"mypibypy UI: RNA target {accession}, system {system_key}."
+            run = dict(results=[one], mode=mode,
+                       note=f"mypibypy UI: RNA target {accession}, "
+                            f"system {system_key}.")
 
 else:
+    st.caption("A junction is one position — the gap sits on the breakpoint — "
+               "so tiling does not apply.")
     try:
         fusions = load_fusions()
     except Exception as exc:  # a missing or malformed loci file
@@ -423,63 +479,103 @@ else:
                 "loci file — see `loci.example.json`.")
     else:
         chosen = st.selectbox("Junction", fusions, format_func=str)
-        if st.button("Design", type="primary"):
+        if st.button("Design probes", type="primary"):
             with st.spinner("Designing both strands…"):
                 both = run_design(design_fusion, chosen, backend=backend,
                                   screen=backend is not None)
             if both:
-                results = both
-                note = f"mypibypy UI: fusion junction {chosen.name}."
+                run = dict(results=both, mode=mode,
+                           note=f"mypibypy UI: fusion junction {chosen.name}.")
+
+# The agent loop belongs to the click that produced the design, not to every
+# rerun, so it is computed here and stored with the results.
+if run and use_agent:
+    primary = run["results"][0]
+    candidates = scan(primary.region_seq, primary.best.interval,
+                      top=len(primary.region_seq)) \
+        if run["mode"] == "Genomic region" else list(primary.candidates)
+
+    def design_fn(params: DesignParameters):
+        return primary, candidates
+
+    agent = DesignAgent(design_fn, client=build_client(client_kind),
+                        budget=Budget(max_turns=2),
+                        known_systems=tuple(sorted(reg)))
+    run["agent"] = agent.run(
+        DesignParameters(system=system_key, n_pairs=int(n_pairs),
+                         min_spacing=int(min_spacing)),
+        target_label=run["note"] or "UI run", request="designed from the UI")
+
+# Results live in session state: a download click or any widget change reruns
+# the script, and without this the table vanished the moment it was used.
+if run:
+    st.session_state["form_run"] = run
+shown = st.session_state.get("form_run")
 
 # --- results ---------------------------------------------------------------
 
-if results:
-    if use_agent:
-        primary = results[0]
-        candidates = scan(primary.region_seq, primary.best.interval,
-                          top=len(primary.region_seq)) if mode == "Genomic region" \
-            else list(primary.candidates)
+st.divider()
+st.subheader("3 · Results")
+if not shown:
+    st.caption("Nothing yet — choose a target above and press **Design probes**.")
+    st.stop()
 
-        def design_fn(params: DesignParameters):
-            return primary, candidates
+results, note = shown["results"], shown["note"]
+if shown["mode"] != mode:
+    st.caption(f"Showing the last result ({shown['mode'].lower()}). "
+               "Press **Design probes** to refresh.")
 
-        agent = DesignAgent(design_fn, client=build_client(client_kind),
-                            budget=Budget(max_turns=2),
-                            known_systems=tuple(sorted(reg)))
-        run = agent.run(DesignParameters(system=system_key, n_pairs=int(n_pairs),
-                                         min_spacing=int(min_spacing)),
-                        target_label=note or "UI run", request="designed from the UI")
-        st.info(f"**Agent: {run.status}** — {run.message}")
-        show_run_record(run.record)
-        st.divider()
+total_pairs = sum(r.n_pairs for r in results)
+total_unscreened = sum(unscreened_pairs(r) for r in results)
+m1, m2, m3 = st.columns(3)
+m1.metric("Pairs designed", total_pairs)
+m2.metric("Specificity screen",
+          "not run" if total_unscreened == total_pairs
+          else f"{total_pairs - total_unscreened}/{total_pairs} screened")
+m3.metric("Channel", results[0].system.fluorophore)
 
-    for result in results:
-        st.subheader(f"{result.locus.gene} {result.locus.name} → "
-                     f"{result.system.fluorophore}")
+st.download_button(
+    "⬇️ Download order workbook (.xlsx)",
+    data=workbook_bytes(results, note),
+    file_name="mypibypy_order.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    type="primary",
+    help="Probe sequences are in the workbook. They are not written anywhere "
+         "inside the repository.",
+)
+
+if shown.get("agent"):
+    agent_run = shown["agent"]
+    st.info(f"**Agent: {agent_run.status}** — {agent_run.message}")
+    with st.expander("Agent run record"):
+        show_run_record(agent_run.record)
+
+for result in results:
+    with st.container(border=True):
+        st.markdown(f"**{result.locus.gene} {result.locus.name}** → "
+                    f"{result.system.fluorophore}")
         n_unscreened = unscreened_pairs(result)
         if n_unscreened:
             st.warning(
                 f"**No genome-wide specificity screen was run** for "
                 f"{n_unscreened} of {result.n_pairs} pair(s). Nothing here "
                 f"establishes single-copy status. Supply a bowtie index and "
-                f"re-run before ordering."
-            )
+                f"re-run before ordering.")
         st.dataframe(candidate_rows(result), hide_index=True,
                      use_container_width=True)
+        weighted, expression_text = expression_status(result)
+        if weighted:
+            st.caption(expression_text)
+        else:
+            st.caption(f"⚠️ {expression_text}")
+        st.caption("P(bound) is the equilibrium fraction bound at the limiting "
+                   "step, on-target vs the worst signal-capable off-target site "
+                   "— a ranking number, not an absolute prediction.")
+        with st.expander("Probe self-folding"):
+            for line in folding_details(result):
+                st.markdown(f"- {line}")
         stats = window_stats(list(result.candidates),
                              DesignParameters(system=system_key))
         st.caption(f"Windows scored: {stats}. The GC/Tm window is reported for "
                    f"context — the pipeline ranks on distance from it rather "
                    f"than rejecting on it.")
-
-    st.download_button(
-        "⬇️ Download order workbook (.xlsx)",
-        data=workbook_bytes(results, note),
-        file_name="mypibypy_order.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
-    st.caption("Probe sequences are in the workbook you download. They are not "
-               "written anywhere inside the repository.")
-else:
-    st.caption("Pick a target and press **Design**.")
