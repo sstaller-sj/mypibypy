@@ -74,7 +74,7 @@ pip install -e .          # from this directory
 Then configure your amplifier systems (see below) and run the tests:
 
 ```bash
-pytest                    # 410 tests, no PYTHONPATH needed
+pytest                    # 512 tests, no PYTHONPATH needed
 ```
 
 ## Usage
@@ -130,8 +130,10 @@ example systems or example loci are in use -- those outputs are not orderable.
 | `pipeline.py`    | locus → fetch → scan → chosen pair                               |
 | `specificity.py` | pair-aware genome screening via local bowtie v1 / blastn         |
 | `crosshyb.py`    | cross-hybridization against the amplifier pool and the order     |
-| `thermo.py`      | buffer-aware Tm and wash-survival margins                        |
+| `thermo.py`      | buffer-aware Tm, wash-survival margins, mismatches priced by position, fraction bound |
+| `expression.py`  | per-gene TPM for weighting off-target genes by abundance         |
 | `accessibility.py` | RNA target-site secondary structure (RNAplfold)                |
+| `fold.py`        | probe self-folding of P1L/P1R (RNAfold, DNA parameters)          |
 | `outcomes.py`    | design → imaging-result record, for calibrating thresholds later |
 | `agent/`         | the agent loop: closed actions, bounds, budgets, run record      |
 | `ui.py`          | presentation helpers for the Streamlit app (testable apart from it) |
@@ -184,6 +186,50 @@ only the planted sites. `bowtie2 --very-sensitive-local`, the obvious first
 choice, is unusable at 25 nt — a single mismatch often leaves no seed — and is
 kept only as a baseline. blastn needs `-dust no`, since DUST masks short queries
 into silence, which looks exactly like a clean result.
+
+### Mismatches priced by position, and fraction bound
+
+Whether an off-target duplex survives the washes used to depend only on how many
+mismatches it had, at a flat 8 °C each. Position and identity matter far more
+than that: on a 25-mer, a terminal mismatch costs under 1 °C and a central one
+5–6 °C. Both aligners report the off-target sequence (bowtie through SAM's `MD`
+tag, BLAST through `sseq`), so each half-site is now priced by walking the actual
+mismatched duplex with published nearest-neighbour parameters: internal
+mismatches from Allawi & SantaLucia and Peyret *et al.*, terminal ones from
+Bommarito *et al.* The tables come from Biopython rather than being retyped, and
+the result matches Biopython's `Tm_NN` to 0.01 °C. Two mismatches at the ends of
+a pad survive the washes; the same two in the middle melt. The count model could
+not tell those apart.
+
+The same dH/dS also give an **equilibrium fraction bound** for probe in excess,
+θ = KC/(1+KC), at the limiting step:
+
+- every `PairSite` carries `fraction_bound` (left × right), and the report
+  carries `on_target_fraction` for the designed pair, so on-target and off-target
+  sites sit on one continuous scale;
+- `thermo_model` on each site says which model priced it. Duplexes the tables do
+  not cover (adjacent mismatches, gapped BLAST hits, a missing `MD` tag) fall back
+  to the count model, and say so, rather than being priced as perfect matches;
+- the margins use the same Ct/4 convention as before, so at margin 0 a site is
+  about 80% bound, not 50%. The washes carry no probe, so equilibrium there is a
+  ranking device, not a kinetic model.
+
+### Probe self-folding
+
+`fold.py` folds each synthesized P1L and P1R with RNAfold using DNA parameters
+(Mathews 2004) at primary-hyb salt. Formamide enters as an effective temperature,
+as it does everywhere else. A primary whose pad folds onto itself cannot reach
+its target, and one whose arm is tied up cannot present half of P2's site. The
+report gives the mean **ensemble** pairing probability over the pad and over the
+arm, with the MFE as context, and the pair takes the worse primary.
+
+The ensemble is used rather than the MFE structure because the MFE misleads on
+weak folds: one example primary's −2.2 kcal/mol MFE was 2% of the ensemble but
+counted 60% of its pad as paired. The words next to the number are anchored to
+background, because at 6× SSC random 47-mers are already a median 39% paired
+(p90 48%). So "open" runs to 50% and "folded" starts at 65%. It is a reported
+attribute, never a reject, it runs for DNA, RNA and fusion designs alike, and
+without RNAfold it is `NOT_EVALUATED`.
 
 ## Fusion junctions
 
@@ -241,6 +287,41 @@ screen_pair(left25, right25, backend=transcriptome, target_gene="MYGENE")
   one and 800 nt apart in the other, because an exon is spliced out of only one.
   Collapsing first would have to pick a representative coordinate and would
   silently invent or destroy sites.
+
+### Weighting off-target genes by expression
+
+An off-target gene at 0.1 TPM and one at 500 TPM in the imaged cells are not the
+same problem, but gene counting treats them alike. Supply a per-gene TPM table
+measured in your cell type or tissue, and each off-target site's penalty is scaled
+by `TPM / (TPM + 10)`:
+
+```bash
+python -m mypibypy rna --loci loci.local.json -o rna_order.xlsx \
+    --transcriptome-index /path/to/gencode/transcripts --expression cells_tpm.tsv
+```
+
+```python
+from mypibypy.expression import load_expression
+screen_pair(left25, right25, backend=transcriptome, target_gene="MYGENE",
+            expression=load_expression("cells_tpm.tsv"))
+```
+
+- Accepted layouts: a two-column gene/TPM table, any table with a gene column and
+  a `TPM` column (RSEM `genes.results`), or salmon `quant.sf`, whose GENCODE
+  transcript names are resolved to genes and summed. Versioned Ensembl IDs match
+  across versions.
+- **A gene missing from the table keeps its full penalty.** Absent is not the
+  same as unexpressed: a filtered table, a renamed symbol and a version mismatch
+  all look like a missing row.
+- Low expression softens `fail` to `review`, **never to `pass`**, and only when
+  every failing off-target gene is listed below 1 TPM. The table is an average
+  over some population, not the cell being imaged.
+- With no table, or on a genome screen (no gene names to match), weighting is
+  `NOT EVALUATED` with a reason and the score is exactly what it was before.
+  Nothing is fetched or defaulted: expression is specific to the cell type.
+- `$MYPIBYPY_EXPRESSION` is used when `--expression` is not given, and by the MCP
+  server. The curve and the 1-TPM floor are uncalibrated, and the caveat goes
+  into the workbook with the number.
 
 ## RNA piFISH
 
@@ -648,6 +729,7 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
 | `MYPIBYPY_SYSTEMS`, `MYPIBYPY_LOCI` | the `*.local.json` beside `pyproject.toml`, else the usual search |
 | `MYPIBYPY_BOWTIE_INDEX` / `MYPIBYPY_BLAST_DB` | none: DNA designs are `NOT SCREENED` |
 | `MYPIBYPY_TRANSCRIPTOME_INDEX` | none: RNA designs are `NOT SCREENED` (see `RNA_SCREEN_POLICY`) |
+| `MYPIBYPY_EXPRESSION` | none: off-target genes are not weighted by abundance |
 | `MYPIBYPY_MCP_OUT` | `designs/` beside `pyproject.toml` |
 | `MYPIBYPY_AGENT_RUNS` | `agent_runs.local.jsonl` beside `pyproject.toml` |
 
@@ -661,7 +743,9 @@ server started.
 from [zFISHer](https://github.com/sstaller-sj/zFISHer), read from that project's
 `reports/<layer>_puncta.csv`. It computes no score and fits no threshold: with
 three designs there is nothing to fit, and this exists so the comparison becomes
-possible later. The store holds real sequences, so it is gitignored
+possible later. Each record also stores the continuous numbers a later fit would
+need: on-target and worst off-target fraction bound, whether expression
+weighting ran, and the probe-folding MFE and pairing. The store holds real sequences, so it is gitignored
 (`outcomes.local.jsonl`).
 
 ## Credit and license

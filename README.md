@@ -45,7 +45,7 @@ pip install -e "./mypibypy[mcp]" && python -m mypibypy mcp
 |---|---|
 | [`mypibypy/`](mypibypy/) | the package, its tests, and [the real README](mypibypy/README.md) |
 | [`mypibypy/src/mypibypy/`](mypibypy/src/mypibypy/) | design, screening and workbook modules |
-| [`mypibypy/tests/`](mypibypy/tests/) | 436 tests; aligner-, folding- and network-backed ones skip when unavailable. No test makes an API call |
+| [`mypibypy/tests/`](mypibypy/tests/) | 512 tests; aligner-, folding- and network-backed ones skip when unavailable. No test makes an API call |
 | [`mypibypy/scripts/`](mypibypy/scripts/) | threshold calibration and backend sensitivity benchmarks |
 
 ## No sequences in this repository
