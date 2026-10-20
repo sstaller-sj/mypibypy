@@ -32,6 +32,7 @@ BUDGET = "budget"
 REFUSAL = "refusal"
 ERROR = "error"
 OUTCOME = "outcome"
+TRANSITION = "transition"
 
 
 def _now() -> str:

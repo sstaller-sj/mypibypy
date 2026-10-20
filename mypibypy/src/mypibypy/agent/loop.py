@@ -38,6 +38,7 @@ from .actions import (
     clamp,
 )
 from .client import DecisionClient
+from .states import BudgetExceeded, Event, Machine, fire_logged
 from .tools import ScreenEvidence, WindowStats, screen_evidence, window_stats
 
 
@@ -284,11 +285,13 @@ class DesignAgent:
                        applied=repr(event.applied))
         record.log_parameters(0, params, "initial (after clamping)")
 
-        relaxations = 0
-        last_eval: Evaluation | None = None
+        machine = Machine(max_turns=self.budget.max_turns,
+                          max_relaxations=self.budget.max_relaxations)
+        fire_logged(machine, record, Event.CLAMPED)
         design = None
 
-        for turn in range(1, self.budget.max_turns + 1):
+        while True:
+            turn = machine.turn
             record.turns_used = turn
 
             design, candidates = self.design_fn(params)
@@ -300,61 +303,75 @@ class DesignAgent:
                             capacity=len(candidates),
                             window_enforced=params.enforce_window,
                             fixed_footprint=len(candidates) <= 1)
-            last_eval = ev
             record.log(rec.TOOL_CALL, turn,
                        f"designed and screened: {ev.n_selected} pair(s), {stats}",
                        windows=stats.__dict__.copy(),
                        verdicts=[s.verdict for s in screens])
+            fire_logged(machine, record, Event.DESIGNED)
 
-            relaxations_left = self.budget.max_relaxations - relaxations
-            situation, why = classify(ev, relaxations_left)
+            situation, why = classify(ev, machine.relaxations_left)
 
             if situation is Situation.CLEAR_PASS:
                 record.log(rec.DETERMINISTIC_DECISION, turn,
                            f"proceed -- {why}", action=Action.PROCEED.value)
+                fire_logged(machine, record, Event.CLEAR_PASS)
                 return self._finish(record, "succeeded", params, ev, design,
                                     f"accepted without consulting the model: {why}")
 
             if situation is Situation.CLEAR_FAIL:
                 record.log(rec.DETERMINISTIC_DECISION, turn,
                            f"fail -- {why}", action=Action.FAIL.value)
+                fire_logged(machine, record, Event.CLEAR_FAIL)
                 return self._finish(record, "failed", params, ev, design, why)
 
+            fire_logged(machine, record, Event.NEEDS_JUDGEMENT)
             decision = self._ask(record, turn, ev, why)
 
             if decision.action in TERMINAL_ACTIONS:
-                status = {"proceed": "succeeded", "fail": "failed",
-                          "flag_for_review": "flagged"}[decision.action.value]
+                event, status = {
+                    Action.PROCEED: (Event.PROCEED, "succeeded"),
+                    Action.FAIL: (Event.FAIL, "failed"),
+                    Action.FLAG_FOR_REVIEW: (Event.FLAG, "flagged"),
+                }[decision.action]
+                fire_logged(machine, record, event)
                 return self._finish(record, status, params, ev, design,
                                     decision.reason)
 
-            if decision.action in RELAXING_ACTIONS:
-                if relaxations_left <= 0:
-                    record.log(rec.BUDGET, turn,
-                               "relaxation budget spent; reporting failure rather "
-                               "than loosening further",
-                               used=relaxations,
-                               limit=self.budget.max_relaxations)
-                    return self._finish(
-                        record, "failed", params, ev, design,
-                        f"no acceptable design after "
-                        f"{self.budget.max_relaxations} relaxation(s)")
-                relaxations += 1
-                record.relaxations_used = relaxations
+            try:
+                fire_logged(machine, record, Event.APPLY,
+                           relaxing=decision.action in RELAXING_ACTIONS)
+            except BudgetExceeded:
+                record.log(rec.BUDGET, turn,
+                           "relaxation budget spent; reporting failure rather "
+                           "than loosening further",
+                           used=machine.relaxations,
+                           limit=self.budget.max_relaxations)
+                fire_logged(machine, record, Event.EXHAUSTED)
+                return self._finish(
+                    record, "failed", params, ev, design,
+                    f"no acceptable design after "
+                    f"{self.budget.max_relaxations} relaxation(s)")
+            record.relaxations_used = machine.relaxations
 
             try:
                 params, change = apply_action(decision.action, params,
                                               self.known_systems)
             except ParameterRefused as exc:
                 record.log(rec.REFUSAL, turn, f"action refused: {exc}")
+                fire_logged(machine, record, Event.REFUSED)
                 return self._finish(record, "failed", params, ev, design, str(exc))
             record.log(rec.TOOL_CALL, turn, f"applied {decision.action.value}: {change}")
             record.log_parameters(turn, params, f"after {decision.action.value}")
 
-        record.log(rec.BUDGET, record.turns_used,
-                   f"turn budget of {self.budget.max_turns} exhausted")
-        return self._finish(record, "failed", params, last_eval, design,
-                            f"turn budget of {self.budget.max_turns} exhausted")
+            try:
+                fire_logged(machine, record, Event.APPLIED)
+            except BudgetExceeded:
+                record.log(rec.BUDGET, turn,
+                           f"turn budget of {self.budget.max_turns} exhausted")
+                fire_logged(machine, record, Event.EXHAUSTED)
+                return self._finish(
+                    record, "failed", params, ev, design,
+                    f"turn budget of {self.budget.max_turns} exhausted")
 
     # -- the one place the model is consulted ------------------------------
     def _ask(self, record: rec.RunRecord, turn: int, ev: Evaluation,

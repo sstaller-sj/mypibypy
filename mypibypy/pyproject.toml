@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 # biopython: the published nearest-neighbour mismatch tables `thermo` prices
 # off-target sites with, used as data rather than retyped.
-dependencies = ["openpyxl>=3.1", "biopython>=1.80"]
+dependencies = ["openpyxl>=3.1", "biopython>=1.80", "pydantic>=2.5"]
 
 [project.optional-dependencies]
 # Pure-Python test suite. The external tools -- the aligners (blast, bowtie,

@@ -519,6 +519,37 @@ export MYPIBYPY_OLLAMA_HOST=http://127.0.0.1:11434
 `build_client()` resolves the kind from argument → env → `ollama`, so swapping
 to an API key or a different local model is configuration, not code.
 
+### State machine and typed decisions
+
+The order a run may take is a table, `agent/states.py`, and `DesignAgent.run`
+drives it rather than holding the order in its `if` branches:
+
+```mermaid
+stateDiagram-v2
+    [*] --> intake
+    intake --> design: clamped
+    design --> evaluate: designed
+    evaluate --> succeeded: clear_pass
+    evaluate --> failed: clear_fail
+    evaluate --> decide: needs_judgement
+    decide --> succeeded: proceed
+    decide --> flagged: flag
+    decide --> failed: fail
+    decide --> relax: apply
+    relax --> design: applied
+    relax --> failed: refused
+```
+
+An event not in the table raises `IllegalTransition`; a relaxation past the
+budget or a turn past `max_turns` raises `BudgetExceeded`, which the loop reports
+as a failure. A hard budget (`exhausted`) can end the run from any live state.
+Every transition is written to the run record (`kind: transition`).
+
+What the model may say is `agent/models.py:DecisionModel` — closed keys, the
+`Action` enum, a signal enum, and a bounded `reason` that is refused if it
+contains an oligo-length run of bases. `Decision.from_payload` applies it to
+every client; `test_models.py` pins it to the hand-written `ACTION_SCHEMA`.
+
 **`think: false` is mandatory, and measured.** qwen3.5 is a thinking model;
 left alone it spends its budget reasoning instead of answering. On one identical
 prompt, warm:

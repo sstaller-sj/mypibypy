@@ -44,13 +44,16 @@ from .client import (
     build_client,
 )
 from .loop import AgentResult, Budget, DesignAgent, Evaluation, Situation, classify
+from .models import DecisionModel
 from .record import RunRecord, RunStore
+from .states import Event, IllegalTransition, Machine, State
 from .tools import ScreenEvidence, WindowStats, screen_evidence, window_stats
 
 __all__ = [
     "ACTION_SCHEMA", "BOUNDS", "RELAXING_ACTIONS", "THINK", "Action", "AgentResult",
     "AnthropicDecisionClient", "Budget", "Decision", "DecisionClient",
-    "DesignAgent", "DesignParameters", "Evaluation", "ModelReply",
+    "DecisionModel", "DesignAgent", "DesignParameters", "Evaluation", "Event",
+    "IllegalTransition", "Machine", "ModelReply", "State",
     "OllamaDecisionClient", "ParameterRefused", "RunRecord", "RunStore",
     "ScreenEvidence",
     "ScriptedClient", "Situation", "WindowStats", "apply_action", "clamp",

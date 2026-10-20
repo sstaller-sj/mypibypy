@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 
+from pydantic import ValidationError
+
 
 class Action(str, Enum):
     """Every move the model is permitted to make. A closed set, by construction.
@@ -288,6 +290,23 @@ class Decision:
             raise ParameterRefused(
                 f"{payload['action']!r} is not one of "
                 f"{[a.value for a in Action]}") from exc
-        return Decision(action=action, reason=str(payload["reason"]),
-                        primary_signal=str(payload["primary_signal"]),
-                        raw=dict(payload), source=source)
+        # The checks above give the readable messages; the typed model adds the
+        # rest of the contract (signal enum, bounded reason, no bases in it) so
+        # every client is held to it, not only the one built on pydantic.
+        from .models import DecisionModel
+        try:
+            checked = DecisionModel.model_validate(payload)
+        except ValidationError as exc:
+            raise ParameterRefused(
+                "decision failed validation: "
+                + "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}"
+                            for e in exc.errors())) from exc
+        return Decision.from_model(checked, raw=dict(payload), source=source)
+
+    @staticmethod
+    def from_model(model, raw: dict | None = None, source: str = "model") -> Decision:
+        """A `Decision` from an already-validated `models.DecisionModel`."""
+        return Decision(action=model.action, reason=model.reason,
+                        primary_signal=model.primary_signal,
+                        raw=raw if raw is not None else model.model_dump(mode="json"),
+                        source=source)
