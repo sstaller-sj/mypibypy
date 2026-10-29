@@ -595,6 +595,25 @@ def resolve_backend(bowtie_index: str | None = None, blast_db: str | None = None
     raise SpecificityNotConfigured("; ".join(problems))
 
 
+def bowtie_backend(index: str, max_mismatches: int = DEFAULT_MAX_MISMATCHES,
+                   threads: int = 1) -> Backend:
+    """A bowtie backend for exactly `index`, or `SpecificityNotConfigured`.
+
+    `resolve_backend` is a search: given a bowtie index it may still fall back
+    to ``$MYPIBYPY_BLAST_DB`` when bowtie is not usable. A caller that was asked
+    for one *named* index must not screen against anything else and report the
+    result as that index, so this never falls back; it says why it cannot run.
+    """
+    exe = shutil.which("bowtie")
+    if not exe:
+        raise SpecificityNotConfigured("bowtie not on PATH")
+    problem = _database_problem("bowtie", index)
+    if problem:
+        raise SpecificityNotConfigured(problem)
+    return Backend(tool="bowtie", database=index, executable=exe,
+                   max_mismatches=max_mismatches, threads=threads)
+
+
 def _database_problem(tool: str, db: str) -> str | None:
     """Why this database is unusable, or None if it looks fine.
 

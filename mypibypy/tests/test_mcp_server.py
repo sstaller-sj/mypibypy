@@ -5,9 +5,12 @@ gone and what each tool accepts and returns is the whole safety story. These
 tests pin the three guarantees the module docstring states:
 
 * no tool takes a sequence, a target or a path -- checked on the LIVE schemas
-  the SDK would advertise, not on a list kept by hand;
+  the SDK would advertise, not on a list kept by hand; the specificity index
+  is chosen by its name in indexes.local.json, and an unknown name is refused;
 * no tool result carries a base;
-* a screen that did not run says so, and placeholder inputs are announced.
+* a screen that did not run says so, and placeholder inputs are announced;
+* `status`, the first call every client makes, reports the machine: missing
+  aligners, PATH, memory and the named indexes.
 
 Designs here are hermetic: genomic fetches are stubbed, and fusions carry their
 own sequence. Tests that need the `mcp` package skip without it.
@@ -18,6 +21,7 @@ import asyncio
 import json
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -25,9 +29,11 @@ import pytest
 
 from mypibypy import mcp_server, pipeline
 from mypibypy.agent.record import RunStore
+from mypibypy.indexes import kind_mismatch, load_indexes
 from mypibypy.mcp_server import (
     DNA_RUN,
     FORBIDDEN_MCP_PARAMETERS,
+    REQUIRED_TOOLS,
     Session,
     configure_environment,
     load_targets,
@@ -66,12 +72,42 @@ def loci_file(tmp_path, keys):
     return path
 
 
+def fake_bowtie_index(directory: Path, name: str) -> str:
+    """The six files bowtie-build leaves behind, empty: enough for the
+    completeness check in `specificity`, and nothing an aligner could run."""
+    for suffix in ("1", "2", "3", "4", "rev.1", "rev.2"):
+        (directory / f"{name}.{suffix}.ebwt").write_text("")
+    return str(directory / name)
+
+
 @pytest.fixture
-def env(monkeypatch, tmp_path, loci_file):
+def indexes_file(tmp_path):
+    """Named indexes: a built genome, a built transcriptome, an unbuilt genome."""
+    data = {"indexes": {
+        "hg38": {"path": fake_bowtie_index(tmp_path, "hg38"), "kind": "genome",
+                 "description": "human GRCh38"},
+        "tx": {"path": fake_bowtie_index(tmp_path, "tx"), "kind": "transcriptome",
+               "description": "test transcripts"},
+        "mm10": {"path": str(tmp_path / "mm10"), "kind": "genome"},
+    }}
+    path = tmp_path / "indexes.test.json"
+    path.write_text(json.dumps(data))
+    return path
+
+
+@pytest.fixture
+def env(monkeypatch, tmp_path, loci_file, indexes_file):
     monkeypatch.setenv("MYPIBYPY_LOCI", str(loci_file))
+    monkeypatch.setenv("MYPIBYPY_INDEXES", str(indexes_file))
     monkeypatch.setenv("MYPIBYPY_AGENT_RUNS", str(tmp_path / "runs.jsonl"))
     monkeypatch.setenv(mcp_server.ENV_OUT_DIR, str(tmp_path / "designs"))
     return tmp_path
+
+
+@pytest.fixture
+def every_tool_found(monkeypatch):
+    """A PATH on which every program exists, whatever the test machine has."""
+    monkeypatch.setattr(shutil, "which", lambda tool, *a, **k: f"/fake/bin/{tool}")
 
 
 @pytest.fixture
@@ -120,12 +156,15 @@ def stubbed(monkeypatch, env):
     cands = scan(seq, iv, top=len(seq))
     sysobj = list(systems().values())[0]
 
+    seen: list = []          # the backend each stubbed run was handed
+
     def make(verdict):
-        monkeypatch.setattr(
-            Session, "_run",
-            lambda self, target, params, screen, pads: [
-                make_design((seq, iv), cands, sysobj, verdict=verdict,
-                            n_pairs=params.n_pairs)])
+        def run(self, target, params, screen, pads, backend=None):
+            seen.append(backend)
+            return [make_design((seq, iv), cands, sysobj, verdict=verdict,
+                                n_pairs=params.n_pairs)]
+        monkeypatch.setattr(Session, "_run", run)
+        return seen
     return make
 
 
@@ -151,8 +190,11 @@ class TestNothingSequenceShapedGoesIn:
     def test_no_free_string_parameter_beyond_ids_and_channel(self):
         # Strings are where bases or coordinates could ride in. Each allowed
         # one is a registry lookup that refuses anything it does not know.
+        # screen_against is a lookup in indexes.local.json: an unknown name is
+        # refused with the configured ones (TestNamedScreens), and the path it
+        # maps to stays on the server.
         allowed = {"target_id", "system", "pad_assignment", "design_ids", "design_id",
-                   "action", "primary_signal", "reason"}
+                   "action", "primary_signal", "reason", "screen_against"}
         for tool in live_tools():
             for name, spec in tool.input_schema.get("properties", {}).items():
                 text = json.dumps(spec)
@@ -478,6 +520,11 @@ class TestRefusalsReachTheClient:
                          target_id="locus:GENE:enh", system="fitc_not_configured")
         assert "unknown system" in text
 
+    def test_an_unknown_index_name_lists_the_configured_ones(self, env, session):
+        text = self.call(self.server(session), "design_target",
+                         target_id="locus:GENE:enh", screen_against="nope")
+        assert "unknown index" in text and "hg38" in text and "tx" in text
+
     def test_a_genuine_bug_still_crashes_generically(self, env, session, monkeypatch):
         from mcp.server.mcpserver.exceptions import UnexpectedToolError
         server = self.server(session)
@@ -489,16 +536,230 @@ class TestRefusalsReachTheClient:
 
 class TestEnvironment:
     def test_configure_never_overrides_what_is_set(self, monkeypatch, tmp_path):
-        for var in ("MYPIBYPY_SYSTEMS", "MYPIBYPY_LOCI", "MYPIBYPY_AGENT_RUNS",
-                    mcp_server.ENV_OUT_DIR):
+        for var in ("MYPIBYPY_SYSTEMS", "MYPIBYPY_LOCI", "MYPIBYPY_INDEXES",
+                    "MYPIBYPY_AGENT_RUNS", mcp_server.ENV_OUT_DIR):
             monkeypatch.delenv(var, raising=False)
         (tmp_path / "loci.local.json").write_text("{}")
+        (tmp_path / "indexes.local.json").write_text("{}")
         monkeypatch.setenv("MYPIBYPY_AGENT_RUNS", "/keep/me.jsonl")
         configure_environment(tmp_path)
         assert os.environ["MYPIBYPY_LOCI"] == str(tmp_path / "loci.local.json")
+        assert os.environ["MYPIBYPY_INDEXES"] == str(tmp_path / "indexes.local.json")
         assert "MYPIBYPY_SYSTEMS" not in os.environ      # no file there to point at
         assert os.environ["MYPIBYPY_AGENT_RUNS"] == "/keep/me.jsonl"
         assert os.environ[mcp_server.ENV_OUT_DIR] == str(tmp_path / "designs")
+
+
+class TestStatusReportsTheMachine:
+    """`status` is the first call every client makes, so the environment problems
+    that used to surface as a design full of NOT SCREENED show up there: the
+    aligners PATH lacks, the PATH itself, memory, and the indexes by name."""
+
+    def test_an_empty_path_reports_every_tool_missing(self, env, session, monkeypatch):
+        monkeypatch.setenv("PATH", "")
+        st = session.status()
+        assert st["path"] == ""
+        assert set(st["tools_missing"]) == set(REQUIRED_TOOLS)
+        assert all(v.startswith("MISSING -- needed for") for v in st["tools"].values())
+        assert any("bowtie is not on the server's PATH" in w for w in st["warnings"])
+
+    def test_tools_found_are_reported_with_their_executable(self, env, session,
+                                                             every_tool_found):
+        st = session.status()
+        assert st["tools"]["bowtie"] == "/fake/bin/bowtie"
+        assert st["tools_missing"] == [] and "warnings" not in st
+        assert set(st["tools"]) == {"bowtie", "bowtie-build", "blastn", "RNAplfold",
+                                    "RNAfold"}
+
+    def test_status_lists_the_named_indexes_and_whether_each_can_run(
+            self, env, session, every_tool_found):
+        st = session.status()
+        assert st["indexes_file"] == os.environ["MYPIBYPY_INDEXES"]
+        by_name = {i["name"]: i for i in st["indexes"]}
+        assert list(by_name) == ["hg38", "tx", "mm10"]              # file order
+        assert by_name["hg38"]["kind"] == "genome" and by_name["hg38"]["usable"] is True
+        assert by_name["hg38"]["description"] == "human GRCh38"
+        assert by_name["tx"]["kind"] == "transcriptome" and by_name["tx"]["usable"] is True
+        assert by_name["mm10"]["usable"] is False
+        assert "not found" in by_name["mm10"]["problem"]
+        assert "screen_against" in st["indexes_note"]
+
+    def test_without_bowtie_no_index_is_usable(self, env, session, monkeypatch):
+        monkeypatch.setenv("PATH", "")
+        entries = session.status()["indexes"]
+        assert entries and all(not e["usable"] and "bowtie not on PATH" in e["problem"]
+                               for e in entries)
+
+    def test_a_malformed_indexes_file_is_reported_not_raised(self, env, session,
+                                                              monkeypatch, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({"indexes": {"hg38": {}}}))
+        monkeypatch.setenv("MYPIBYPY_INDEXES", str(bad))
+        st = session.status()
+        assert st["indexes_file"].startswith("NOT CONFIGURED") and st["indexes"] == []
+
+    def test_no_indexes_file_says_how_to_add_one(self, env, session, monkeypatch,
+                                                  tmp_path):
+        monkeypatch.delenv("MYPIBYPY_INDEXES")
+        monkeypatch.chdir(tmp_path)              # nothing to find upward from here
+        st = session.status()
+        assert st["indexes_file"].startswith("none")
+        assert "indexes.example.json" in st["indexes_file"] and st["indexes"] == []
+
+    def test_status_reports_memory_or_says_it_cannot(self, env, session):
+        mem = session.status()["memory"]
+        if isinstance(mem, str):
+            assert mem.startswith("not available")
+        else:
+            assert mem["total_gb"] > 0 and mem["swap_total_gb"] >= 0
+            assert set(mem) >= {"free_gb", "available_gb", "used_gb", "swap_used_gb"}
+
+    def test_memory_is_parsed_from_the_mac_tools(self):
+        vm_stat = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+                   "Pages free:                                     5677.\n"
+                   "Pages active:                                 230804.\n"
+                   "Pages inactive:                               228703.\n"
+                   "Pages speculative:                               868.\n"
+                   "Pages wired down:                             194387.\n"
+                   "Pages purgeable:                                4340.\n"
+                   '"Translation faults":                     1671861231.\n'
+                   "Pages occupied by compressor:                 479822.\n")
+        swap = "total = 4096.00M  used = 3056.62M  free = 1039.38M  (encrypted)\n"
+        mem = mcp_server._darwin_memory(vm_stat, "19327352832\n", swap)
+        page, gb = 16384, 2 ** 30
+        assert mem["total_gb"] == 18.0
+        assert mem["free_gb"] == round((5677 + 868) * page / gb, 2)
+        assert mem["available_gb"] == round((5677 + 868 + 228703 + 4340) * page / gb, 2)
+        assert mem["used_gb"] == round((230804 + 194387 + 479822) * page / gb, 2)
+        assert mem["swap_total_gb"] == 4.0
+        assert mem["swap_used_gb"] == round(3056.62 * 2 ** 20 / gb, 2)
+        assert "3 GB" in mem["note"]
+
+    def test_memory_is_parsed_from_proc_meminfo(self):
+        text = ("MemTotal:       16384000 kB\nMemFree:         1024000 kB\n"
+                "MemAvailable:    8192000 kB\nSwapTotal:       2048000 kB\n"
+                "SwapFree:        1024000 kB\n")
+        mem = mcp_server._meminfo_memory(text)
+        gb = 2 ** 30
+        assert mem["total_gb"] == round(16384000 * 1024 / gb, 2)
+        assert mem["available_gb"] == round(8192000 * 1024 / gb, 2)
+        assert mem["used_gb"] == round((16384000 - 8192000) * 1024 / gb, 2)
+        assert mem["swap_used_gb"] == round(1024000 * 1024 / gb, 2)
+
+    def test_memory_degrades_to_a_sentence_when_the_tools_fail(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        def boom(*args, **kwargs):
+            raise OSError("no vm_stat here")
+        monkeypatch.setattr(mcp_server.subprocess, "run", boom)
+        assert mcp_server.machine_memory() == "not available: no vm_stat here"
+
+
+class TestNamedScreens:
+    """`screen_against` is a name from indexes.local.json, resolved on the server
+    to a bowtie backend; the client never sees or passes a path, and a wrong kind
+    is refused in the words the Form uses."""
+
+    def test_an_unknown_name_is_refused_with_the_configured_names(self, env, session):
+        from mypibypy.agent.actions import ParameterRefused
+        with pytest.raises(ParameterRefused) as info:
+            session.design_target("locus:GENE:enh", screen_against="unknown")
+        text = str(info.value)
+        assert "unknown index 'unknown'" in text and "never a path" in text
+        assert "hg38 (genome, human GRCh38)" in text and "tx (transcriptome" in text
+        record = RunStore().all()[-1]
+        assert record.status == "failed" and record.of_kind("refusal")
+        assert not session.designs, "a refused design is not stored"
+
+    def test_the_path_of_a_configured_index_is_still_not_a_name(self, env, session):
+        path = load_indexes()["hg38"].path
+        with pytest.raises(ValueError, match="unknown index"):
+            session.design_target("locus:GENE:enh", screen_against=path)
+
+    def test_a_wrong_kind_is_refused_in_the_forms_words(self, env, session):
+        named = load_indexes()
+        with pytest.raises(ValueError) as info:
+            session.design_target("rna:TP53:cds", screen_against="hg38")
+        assert kind_mismatch(named["hg38"], "transcriptome") in str(info.value)
+        assert "splice junction" in str(info.value) and "['tx']" in str(info.value)
+        with pytest.raises(ValueError) as info:
+            session.design_target("locus:GENE:enh", screen_against="tx")
+        assert kind_mismatch(named["tx"], "genome") in str(info.value)
+        assert "'hg38'" in str(info.value) and "'mm10'" in str(info.value)
+        with pytest.raises(ValueError, match="is a transcriptome index"):
+            session.design_target("fusion:demo_junction", screen_against="tx")
+
+    def test_a_named_index_reaches_the_pipeline_as_a_bowtie_backend(
+            self, env, stubbed, session, every_tool_found):
+        seen = stubbed("pass")
+        named = load_indexes()
+        out = session.design_target("locus:GENE:enh", screen_against="hg38")
+        assert out["state"] == "succeeded"
+        assert out["screened_against"] == "hg38 (genome, human GRCh38)"
+        backend = seen[-1]
+        assert backend.tool == "bowtie" and backend.executable == "/fake/bin/bowtie"
+        assert backend.database == named["hg38"].path
+        out = session.design_target("rna:TP53:cds", screen_against="tx")
+        assert seen[-1].database == named["tx"].path and out["kind"] == "rna"
+        out = session.design_target("fusion:demo_junction", screen_against="hg38")
+        assert seen[-1].database == named["hg38"].path
+
+    def test_without_a_name_the_servers_default_is_used_and_named(self, env, stubbed):
+        from mypibypy.specificity import Backend
+        default = Backend(tool="bowtie", database="/srv/hg38",
+                          executable="/fake/bin/bowtie")
+        session = Session(genome_backend=default, transcriptome_reason="no index in tests")
+        seen = stubbed("pass")
+        out = session.design_target("locus:GENE:enh")
+        assert seen[-1] is default
+        assert out["screened_against"].startswith("default genome: bowtie v1")
+        assert out["screened_against"].endswith("/srv/hg38")
+
+    def test_no_default_and_the_skip_are_named_too(self, env, offline, session):
+        assert (session.design_target("locus:GENE:enh")["screened_against"]
+                == "none -- no index in tests")
+        out = session.design_target("locus:GENE:enh", screen=False)
+        assert out["screened_against"] == "off (skipped by request)"
+        assert "skipped by request" in out["results"][0]["pairs"][0]["specificity_detail"]
+
+    def test_a_name_contradicts_screen_false(self, env, session):
+        with pytest.raises(ValueError, match="screen=False"):
+            session.design_target("locus:GENE:enh", screen=False, screen_against="hg38")
+
+    def test_a_name_that_cannot_run_is_refused_with_the_reason(self, env, session,
+                                                                monkeypatch):
+        monkeypatch.setenv("PATH", "")
+        with pytest.raises(RuntimeError, match="bowtie not on PATH") as info:
+            session.design_target("locus:GENE:enh", screen_against="hg38")
+        assert "status" in str(info.value) and "screen=False" in str(info.value)
+        monkeypatch.setattr(shutil, "which", lambda tool, *a, **k: f"/fake/bin/{tool}")
+        with pytest.raises(RuntimeError, match="mm10 cannot be screened against.*not found"):
+            session.design_target("locus:GENE:enh", screen_against="mm10")
+        assert not session.designs
+        assert all(r.status == "failed" for r in RunStore().all())
+
+    def test_a_malformed_indexes_file_refuses_a_named_screen(self, env, session,
+                                                              monkeypatch, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("not json")
+        monkeypatch.setenv("MYPIBYPY_INDEXES", str(bad))
+        with pytest.raises(RuntimeError, match="could not be read"):
+            session.design_target("locus:GENE:enh", screen_against="hg38")
+
+    def test_the_run_record_says_what_was_screened_against(self, env, stubbed, session,
+                                                            every_tool_found):
+        stubbed("pass")
+        out = session.design_target("locus:GENE:enh", screen_against="hg38")
+        record = RunStore().get(out["run_id"])
+        assert "screen: hg38 (genome, human GRCh38)" in record.parameters_history[0]["note"]
+
+    def test_a_named_screen_result_carries_no_base_or_index_path(
+            self, env, stubbed, session, every_tool_found):
+        stubbed("pass")
+        named = load_indexes()
+        text = json.dumps(session.design_target("locus:GENE:enh", screen_against="hg38"))
+        assert not DNA_RUN.findall(text)
+        assert named["hg38"].path not in text
 
 
 class TestTroubleshooting:

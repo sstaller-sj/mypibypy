@@ -745,10 +745,12 @@ python -m mypibypy mcp           # stdio server; an MCP client launches this its
 
 | tool | does |
 |---|---|
-| `status` | which systems / loci files are loaded, whether they are placeholders, which screens are configured, where workbooks go |
+| `status` | call it first: which systems / loci / indexes files are loaded and whether they are placeholders; which external programs (`bowtie`, `bowtie-build`, `blastn`, `RNAplfold`, `RNAfold`) are on the server's `PATH`, and the `PATH` itself; free memory and swap; the named specificity indexes from `indexes.local.json`, each with whether it can run right now; the default screens; where workbooks go |
 | `list_targets` | every locus, fusion and RNA target in the loci file, with its id |
-| `design_target` | design and screen one target by id; tiling, spacing and channel are parameters |
+| `design_target` | design and screen one target by id; tiling, spacing and channel are parameters, and `screen_against` names a configured index (a genome for a locus or fusion, a transcriptome for an RNA target; an unknown name or a wrong kind is refused, with the configured names) |
 | `decide_design` | resolve a design stopped at a decision point: `proceed`, `flag_for_review`, `fail`, `reduce_pairs` or `switch_system`, with a short reason; on a `flagged` design, `proceed` alone accepts it as it is; refused in any other state |
+| `diagnose_design` | explain a design in the software's sentences: why pairs are missing, how windows sit against the GC/Tm window, whether pairs were screened, how folded the primaries are; previews fixes when pairs are missing; changes nothing |
+| `try_change` | preview how many pairs a different `n_pairs` / `min_spacing` would place, without designing; changes nothing |
 | `write_order` | write one order workbook for designs that have **succeeded**; returns its path |
 
 Under MCP the client decides what to call and in what order, so the agent's fixed
@@ -780,8 +782,11 @@ code:
 - **No tool takes a sequence, a target or a path.** Targets are addressed by id
   from the loci file, so Claude cannot point the pipeline at a region,
   accession or file of its own. To design something new, add it to
-  `loci.local.json`. `tests/test_mcp_server.py` checks this against the schemas
-  the server actually advertises.
+  `loci.local.json`. The specificity index is chosen the same way: by the name
+  the lab gave it in `indexes.local.json`, which the server resolves to a bowtie
+  backend; the path never crosses the wire in either direction.
+  `tests/test_mcp_server.py` checks this against the schemas the server
+  actually advertises.
 - **No tool returns a base.** Results carry pair names, coordinates, GC, Tm,
   QC flags and screen verdicts. The oligo sequences go only into the workbook,
   which the server names and saves under `designs/` (gitignored), so unpublished
@@ -795,12 +800,18 @@ Numbers go through the same `clamp` as the form and the chat. An unknown channel
 is refused, and fusions refuse tiling for the reason given above.
 
 **Registering it.** Use the conda env's Python, and put the env's `bin` on
-`PATH` so bowtie, blastn and RNAplfold are found. MCP clients start servers with
-a minimal environment. If the variables below are unset, the server uses
-`systems.local.json`, `loci.local.json` and `designs/` from this directory. The
-index paths are the ones you named in `indexes.local.json` (the Streamlit app
-reads that file; the MCP server takes them from these two variables), given as
-bowtie's index prefix, not a file.
+`PATH` so bowtie, blastn, RNAplfold and RNAfold are found. MCP clients start
+servers with a minimal environment, and `status` says which of those programs
+the server can see and what `PATH` it got, so a missing `bin` shows up on the
+first call rather than as a design full of `NOT SCREENED`. If the variables
+below are unset, the server uses `systems.local.json`, `loci.local.json`,
+`indexes.local.json` and `designs/` from this directory. The indexes file is
+the same one the Streamlit app reads: `status` lists its names and whether each
+can run, and `design_target` takes one of them as `screen_against`, so Claude
+can choose *which* genome or transcriptome a design is screened against by
+name, never by path. The two index variables below set the **defaults** used
+when no name is given, as bowtie's index prefix, not a file; with the indexes
+file in place they are optional.
 
 Claude Code:
 
@@ -832,9 +843,9 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
 
 | variable | default |
 |---|---|
-| `MYPIBYPY_SYSTEMS`, `MYPIBYPY_LOCI` | the `*.local.json` beside `pyproject.toml`, else the usual search |
-| `MYPIBYPY_BOWTIE_INDEX` / `MYPIBYPY_BLAST_DB` | none: DNA designs are `NOT SCREENED` |
-| `MYPIBYPY_TRANSCRIPTOME_INDEX` | none: RNA designs are `NOT SCREENED` (see `RNA_SCREEN_POLICY`) |
+| `MYPIBYPY_SYSTEMS`, `MYPIBYPY_LOCI`, `MYPIBYPY_INDEXES` | the `*.local.json` beside `pyproject.toml`, else the usual search |
+| `MYPIBYPY_BOWTIE_INDEX` / `MYPIBYPY_BLAST_DB` | none: DNA designs are `NOT SCREENED` unless `screen_against` names an index |
+| `MYPIBYPY_TRANSCRIPTOME_INDEX` | none: RNA designs are `NOT SCREENED` unless `screen_against` names a transcriptome (see `RNA_SCREEN_POLICY`) |
 | `MYPIBYPY_EXPRESSION` | none: off-target genes are not weighted by abundance |
 | `MYPIBYPY_MCP_OUT` | `designs/` beside `pyproject.toml` |
 | `MYPIBYPY_AGENT_RUNS` | `agent_runs.local.jsonl` beside `pyproject.toml` |

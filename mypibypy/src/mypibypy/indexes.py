@@ -80,6 +80,24 @@ def bowtie_index_problem(path: str) -> str | None:
             f"to it; build one with bowtie-build)")
 
 
+def kind_mismatch(index: ScreenIndex, wanted: str) -> str | None:
+    """Why `index` must not screen a target that needs a `wanted` index, or None.
+
+    `wanted` is "transcriptome" for an RNA target and "genome" for a locus or a
+    fusion junction. One source for the sentence, so the Form, the chat and the
+    MCP server refuse (or warn about) the same mismatch in the same words.
+    """
+    if index.kind == wanted:
+        return None
+    if wanted == "transcriptome":
+        return (f"**{index.name}** is a {index.kind} index. A footprint that spans "
+                f"a splice junction does not map contiguously to a genome, so it "
+                f"can look falsely clean.")
+    return (f"**{index.name}** is a {index.kind} index. A genomic footprint can "
+            f"have off-target sites in introns and intergenic DNA, which a "
+            f"transcriptome does not contain, so it can look falsely clean.")
+
+
 def _search_upward(filename: str, start: Path | None = None) -> Path | None:
     here = (start or Path.cwd()).resolve()
     for d in (here, *here.parents):
