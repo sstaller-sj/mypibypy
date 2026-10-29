@@ -753,6 +753,13 @@ python -m mypibypy mcp           # stdio server; an MCP client launches this its
 | `try_change` | preview how many pairs a different `n_pairs` / `min_spacing` would place, without designing; changes nothing |
 | `write_order` | write one order workbook for designs that have **succeeded**; returns its path |
 
+Beside the tools, two read-only **resources** a client can open without a tool
+call: `run://<run_id>` is a run's record (the same `agent_runs.local.jsonl` the
+agent loop writes, so runs from earlier servers and from the loop are readable
+too), and `design://<design_id>/diagnosis` is `diagnose_design`'s output for a
+design of this session. Both go through the same no-bases filter: any run of
+fifteen or more bases is replaced by `[sequence withheld]` before it leaves.
+
 Under MCP the client decides what to call and in what order, so the agent's fixed
 decision structure no longer applies. The server puts it back with the same state
 machine the agent loop runs (`agent/states.py`): every design is a run with a

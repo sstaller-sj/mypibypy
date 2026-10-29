@@ -34,6 +34,7 @@ from mypibypy.mcp_server import (
     DNA_RUN,
     FORBIDDEN_MCP_PARAMETERS,
     REQUIRED_TOOLS,
+    SEQUENCE_WITHHELD,
     Session,
     configure_environment,
     load_targets,
@@ -538,7 +539,11 @@ class TestEnvironment:
     def test_configure_never_overrides_what_is_set(self, monkeypatch, tmp_path):
         for var in ("MYPIBYPY_SYSTEMS", "MYPIBYPY_LOCI", "MYPIBYPY_INDEXES",
                     "MYPIBYPY_AGENT_RUNS", mcp_server.ENV_OUT_DIR):
-            monkeypatch.delenv(var, raising=False)
+            # Registered with monkeypatch even when absent, so what
+            # configure_environment writes into os.environ is undone afterwards
+            # instead of leaking into later tests.
+            monkeypatch.setenv(var, "unset by this test")
+            monkeypatch.delenv(var)
         (tmp_path / "loci.local.json").write_text("{}")
         (tmp_path / "indexes.local.json").write_text("{}")
         monkeypatch.setenv("MYPIBYPY_AGENT_RUNS", "/keep/me.jsonl")
@@ -645,6 +650,15 @@ class TestStatusReportsTheMachine:
         assert mem["available_gb"] == round(8192000 * 1024 / gb, 2)
         assert mem["used_gb"] == round((16384000 - 8192000) * 1024 / gb, 2)
         assert mem["swap_used_gb"] == round(1024000 * 1024 / gb, 2)
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat and sysctl are macOS")
+    def test_memory_is_read_even_on_the_minimal_path_a_client_sets(self, monkeypatch):
+        # sysctl is in /usr/sbin, which the README's registration PATH lacks;
+        # seen live as "not available: No such file or directory: 'sysctl'".
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        assert mcp_server.machine_memory()["total_gb"] > 0
+        monkeypatch.setenv("PATH", "")
+        assert mcp_server.machine_memory()["total_gb"] > 0
 
     def test_memory_degrades_to_a_sentence_when_the_tools_fail(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -760,6 +774,75 @@ class TestNamedScreens:
         text = json.dumps(session.design_target("locus:GENE:enh", screen_against="hg38"))
         assert not DNA_RUN.findall(text)
         assert named["hg38"].path not in text
+
+
+class TestResources:
+    """The run record and a design's diagnosis as MCP resources: readable without
+    a tool call, under the same no-bases guarantee as every tool result."""
+
+    EXPECTED = {"run://{run_id}", "design://{design_id}/diagnosis"}
+
+    def server(self, session):
+        pytest.importorskip("mcp")
+        return mcp_server.build_server(session)
+
+    def read(self, server, uri: str) -> str:
+        return "".join(c.content for c in asyncio.run(server.read_resource(uri)))
+
+    def test_the_templates_are_exactly_the_reviewed_ones(self, env, session):
+        server = self.server(session)
+        templates = asyncio.run(server.list_resource_templates())
+        assert {t.uri_template for t in templates} == self.EXPECTED
+        assert all(t.mime_type == "application/json" for t in templates)
+        assert asyncio.run(server.list_resources()) == []       # nothing static
+
+    def test_a_run_record_is_readable_by_its_id(self, env, offline, session):
+        server = self.server(session)
+        out = accepted(session, "locus:GENE:enh")
+        record = json.loads(self.read(server, f"run://{out['run_id']}"))
+        assert record["run_id"] == out["run_id"] and record["status"] == "succeeded"
+        assert record["target"] == "locus:GENE:enh"
+        kinds = {e["kind"] for e in record["events"]}
+        assert {"transition", "model_decision", "outcome"} <= kinds
+
+    def test_a_record_that_quotes_bases_has_them_withheld(self, env, offline, session):
+        """Loop runs quote sequences in their records; a resource must not."""
+        server = self.server(session)
+        out = session.design_target("locus:GENE:enh")
+        stored = session.designs[out["design_id"]]
+        stored.record.log("tool_call", 0, "designed pair " + "ACGT" * 8,
+                          p1l="TTGACCA" * 4)
+        RunStore().append(stored.record)
+        text = self.read(server, f"run://{out['run_id']}")
+        assert not DNA_RUN.findall(text)
+        assert text.count(SEQUENCE_WITHHELD) == 2
+        assert json.loads(text)["run_id"] == out["run_id"]     # still valid JSON
+
+    def test_a_diagnosis_is_readable_and_base_free(self, env, offline, session):
+        server = self.server(session)
+        d = session.design_target("locus:GENE:enh", n_pairs=9, min_spacing=40)["design_id"]
+        text = self.read(server, f"design://{d}/diagnosis")
+        diag = json.loads(text)
+        assert diag["design_id"] == d and diag["facts"] and diag["what_if"]
+        assert diag == session.diagnose_design(d)
+        assert not DNA_RUN.findall(text)
+
+    def test_unknown_ids_are_refused_with_the_reason(self, env, session):
+        from mcp.server.mcpserver.exceptions import ResourceError
+        server = self.server(session)
+        with pytest.raises(ResourceError, match="unknown run id 'run_nothing'"):
+            self.read(server, "run://run_nothing")
+        with pytest.raises(ResourceError, match="unknown design id 'd_nope'"):
+            self.read(server, "design://d_nope/diagnosis")
+
+    def test_reading_moves_nothing(self, env, offline, session):
+        server = self.server(session)
+        out = session.design_target("locus:GENE:enh")
+        stored = session.designs[out["design_id"]]
+        before = (stored.state, len(stored.record.events), len(RunStore().all()))
+        self.read(server, f"run://{out['run_id']}")
+        self.read(server, f"design://{out['design_id']}/diagnosis")
+        assert before == (stored.state, len(stored.record.events), len(RunStore().all()))
 
 
 class TestTroubleshooting:

@@ -24,6 +24,9 @@ accept and what it will hand back. Three of them, all structural:
 
 Every design call lands in the same run record the agent loop writes
 (`agent.record`), so an MCP-driven design is as traceable as a loop-driven one.
+That record, and a design's diagnosis, are also MCP *resources* (`run://<run_id>`,
+`design://<design_id>/diagnosis`), under the same no-bases guarantee: a resource
+is a tool result by another door, so anything oligo-shaped is withheld from it.
 
 The server is thin on purpose: `pipeline` does the work, `cli.design_warnings`
 writes the provenance note, `agent.actions.clamp` bounds the numbers. Nothing
@@ -31,6 +34,7 @@ here is a second design path.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -121,8 +125,10 @@ FORBIDDEN_MCP_PARAMETERS = FORBIDDEN_TOOL_PARAMETERS | frozenset({
 })
 
 #: Anything that looks like oligo-length DNA. Used by the tests to prove tool
-#: output carries no bases; 15 nt is shorter than any pad (25) or arm.
+#: output carries no bases; 15 nt is shorter than any pad (25) or arm. The
+#: resources also use it as a filter, replacing every match.
 DNA_RUN = re.compile(r"[ACGTacgt]{15,}")
+SEQUENCE_WITHHELD = "[sequence withheld]"
 
 
 def _checkout_dir() -> Path:
@@ -634,6 +640,21 @@ class Session:
             out["warnings"] = [str(c) for c in clamps]
         return out
 
+    def run_record(self, run_id: str) -> dict:
+        """One run's record from the store, as this server or the loop wrote it.
+
+        Read-only. Records outlive the session -- that is their point -- so a
+        run from an earlier server, or from the agent loop, is readable too.
+        Served as the `run://` resource, which withholds any sequence a loop
+        run quoted.
+        """
+        record = rec.RunStore().get(run_id)
+        if record is None:
+            raise ValueError(f"unknown run id {run_id!r}; design_target returns a "
+                             f"run_id per design, and the record file is "
+                             f"{rec.resolve_store_path()}")
+        return record.to_dict()
+
     def _screen_choice(self, target: Target, screen: bool,
                        screen_against: str | None) -> tuple[object, str]:
         """(backend or None, label) for a design's specificity screen.
@@ -910,9 +931,18 @@ def machine_memory() -> dict | str:
     return f"not available on {sys.platform}"
 
 
+#: Where macOS and Linux keep the system tools, for when the server's PATH does
+#: not: `sysctl` is in /usr/sbin, which the minimal PATH an MCP registration
+#: sets (the README's is `<env>/bin:/usr/bin:/bin`) leaves out.
+_SYSTEM_PATH = "/usr/sbin:/sbin:/usr/bin:/bin"
+
+
 def _command(cmd: list[str]) -> str:
-    return subprocess.run(cmd, capture_output=True, text=True, check=True,
-                          timeout=10).stdout
+    exe = shutil.which(cmd[0]) or shutil.which(cmd[0], path=_SYSTEM_PATH)
+    if not exe:
+        raise OSError(f"{cmd[0]} not found on PATH or in {_SYSTEM_PATH}")
+    return subprocess.run([exe, *cmd[1:]], capture_output=True, text=True,
+                          check=True, timeout=10).stdout
 
 
 def _si_bytes(value: str, unit: str) -> float:
@@ -987,7 +1017,9 @@ acceptance is recorded against the order. `decide_design` is refused in any \
 other state. `write_order` refuses a design that has not succeeded. To explain a design or troubleshoot one that \
 placed too few pairs, call `diagnose_design`, and `try_change` to preview a \
 pair count or spacing; quote their sentences rather than working the numbers \
-out yourself. Report any "NOT SCREENED" specificity or \
+out yourself. A run's record is also readable as the resource `run://<run_id>`, \
+and a design's diagnosis as `design://<design_id>/diagnosis`. \
+Report any "NOT SCREENED" specificity or \
 placeholder-input warning to the user verbatim: it means no off-target screen \
 was run, not that the design passed one.
 """
@@ -997,7 +1029,7 @@ def build_server(session: Session | None = None):
     """The MCP server over a `Session`. Imports the SDK here so the rest of this
     module, and its tests, work without it installed."""
     from mcp.server.mcpserver import MCPServer
-    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp.server.mcpserver.exceptions import ResourceError, ToolError
     from mcp.types import ToolAnnotations
 
     session = session or Session.from_environment()
@@ -1116,6 +1148,43 @@ def build_server(session: Session | None = None):
         in this session). Refused for any design whose state is not 'succeeded'. The server names the file and saves it in the
         workbook directory shown by status; the path is returned."""
         return refusing(session.write_order, design_ids)
+
+    # -- resources: views a client can open without a tool call ---------------
+
+    def reading(fn, *args) -> str:
+        """A resource body: JSON, with any run of bases withheld.
+
+        The run record is written by the agent loop too, and the loop's records
+        quote designed sequences (which is why the file is gitignored). A
+        resource is a tool result by another door, so the guarantee holds here
+        structurally rather than by inspection: anything oligo-shaped is
+        replaced before it leaves, whatever the record holds. Refusals become
+        `ResourceError`, the resource analog of `ToolError`.
+        """
+        try:
+            payload = fn(*args)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise ResourceError(str(exc)) from exc
+        return DNA_RUN.sub(SEQUENCE_WITHHELD, json.dumps(payload, indent=1))
+
+    @server.resource("run://{run_id}", name="run record",
+                     mime_type="application/json",
+                     description="The durable record of one design run (the run_id "
+                                 "design_target returns): every transition, clamp, "
+                                 "decision and refusal with its evidence, as JSON. "
+                                 "Runs from earlier servers and from the agent loop "
+                                 "are readable too. Sequences are withheld.")
+    def run_record(run_id: str) -> str:
+        return reading(session.run_record, run_id)
+
+    @server.resource("design://{design_id}/diagnosis", name="design diagnosis",
+                     mime_type="application/json",
+                     description="diagnose_design for a design of this session, as a "
+                                 "resource: the software's sentences on placement, the "
+                                 "GC/Tm window, the screen and folding, and previews "
+                                 "when pairs are missing.")
+    def design_diagnosis(design_id: str) -> str:
+        return reading(session.diagnose_design, design_id)
 
     return server
 
