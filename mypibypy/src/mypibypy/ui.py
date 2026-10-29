@@ -59,9 +59,35 @@ def workbook_bytes(results, note: str) -> bytes:
         return path.read_bytes()
 
 
+def no_change_reply(intent: str, run_number: int) -> str:
+    """The chat's answer when a design request changes nothing the design uses.
+
+    "Too few passed, loosen the Tm" came back as a change with every field at
+    its sentinel and a note promising to loosen the Tm; the app then designed
+    the identical run again under that promise. The pipeline is deterministic,
+    so nothing is designed and the reply says what would change it instead.
+    """
+    return (f"The model read that as *{intent}*, but it changes none of the "
+            f"settings the design uses (channel, pairs, minimum spacing, the "
+            f"specificity screen, GC/Tm enforcement), so run #{run_number} stands: "
+            f"the pipeline is deterministic and designing again would give the same "
+            f"pairs. The GC/Tm window itself cannot be widened from the chat; it "
+            f"only rejects windows when enforcement is on. Say what to change, e.g. "
+            f"*6 pairs*, *20 nt spacing*, *screen against hg38* or *enforce the "
+            f"GC/Tm window*.")
+
+
 def unscreened_pairs(result) -> int:
     """How many ordered pairs have no specificity result. Drives the UI warning."""
     return sum(1 for screen in result.pair_screens if not screen.screened)
+
+
+def unscreened_reason(result) -> str:
+    """Why the first unscreened pair was not screened, or "" if all were."""
+    for screen in result.pair_screens:
+        if not screen.screened:
+            return screen.reason or "no reason recorded"
+    return ""
 
 
 def folding_cell(fold) -> str:

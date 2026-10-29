@@ -74,7 +74,7 @@ pip install -e .          # from this directory
 Then configure your amplifier systems (see below) and run the tests:
 
 ```bash
-pytest                    # 512 tests, no PYTHONPATH needed
+pytest                    # about 770 tests, no PYTHONPATH needed
 ```
 
 ## Usage
@@ -466,8 +466,10 @@ decides the next step. The pipeline was built first and works without any of
 this.
 
 **The model is reserved for conflicts.** A deterministic classifier runs first
-and sorts every evaluation into `CLEAR_PASS`, `CLEAR_FAIL`, or
-`NEEDS_JUDGEMENT`; only the last consults a model. A lone-arm off-target hit
+and sorts every evaluation into `CLEAR_PASS`, `CLEAR_FAIL`, `UNSCREENED` or
+`NEEDS_JUDGEMENT`; only the last consults a model. A pair nobody screened is a
+missing input, not a conflict, so the run is flagged for a human without a
+model call. A lone-arm off-target hit
 whose partner arm has nothing nearby cannot recruit P2 and so cannot make a
 spot — that is geometry, already coded, and routing it through a language model
 would add cost, latency and a chance of a confident wrong answer for no gain.
@@ -489,9 +491,12 @@ Six things are load-bearing:
 4. **Parameter bounds are code.** Out-of-range values are clamped and the clamp
    is recorded; an unknown system is refused outright, because there is no
    nearest valid channel and guessing orders the wrong dye.
-5. **A durable run record.** Every tool call, clamp and decision, with the
-   evidence it was made on, appended to a gitignored JSONL.
+5. **A durable run record.** Every agent run — the Form's agent loop or the
+   MCP server — appends every tool call, clamp and decision, with the evidence
+   it was made on, to a gitignored JSONL (`agent_runs.local.jsonl`).
    `record.explain()` renders it as prose for the question "why this probe".
+   Chat designs run the pipeline directly; they are kept in the session's run
+   list, not in the record.
 6. **Hard budgets.** Turns, model calls, tokens, and at most **three
    relaxations** — then the run reports failure rather than loosening until
    something passes, which is how a loop comes to "succeed" every time.
@@ -519,6 +524,14 @@ export MYPIBYPY_OLLAMA_HOST=http://127.0.0.1:11434
 `build_client()` resolves the kind from argument → env → `ollama`, so swapping
 to an API key or a different local model is configuration, not code.
 
+The request pins every sampler setting (`client.SAMPLING`: greedy, no presence
+or repeat penalty — the Modelfile's `presence_penalty 1.5` made the model
+misquote the numbers it was asked to repeat) and asks Ollama to keep the model
+resident for 30 minutes (`client.KEEP_ALIVE`, or `$MYPIBYPY_OLLAMA_KEEP_ALIVE`),
+so only the first call of a session pays the ~8 s load. A call that times out
+says the machine is probably short of memory, which is what it means on an
+18 GB laptop, rather than telling you to start a server that is running.
+
 ### State machine and typed decisions
 
 The order a run may take is a table, `agent/states.py`, and `DesignAgent.run`
@@ -531,6 +544,7 @@ stateDiagram-v2
     design --> evaluate: designed
     evaluate --> succeeded: clear_pass
     evaluate --> failed: clear_fail
+    evaluate --> flagged: unscreened
     evaluate --> decide: needs_judgement
     decide --> succeeded: proceed
     decide --> flagged: flag
@@ -538,12 +552,22 @@ stateDiagram-v2
     decide --> relax: apply
     relax --> design: applied
     relax --> failed: refused
+    flagged --> succeeded: override
 ```
 
 An event not in the table raises `IllegalTransition`; a relaxation past the
 budget or a turn past `max_turns` raises `BudgetExceeded`, which the loop reports
 as a failure. A hard budget (`exhausted`) can end the run from any live state.
-Every transition is written to the run record (`kind: transition`).
+`override` is the one exit from a terminal state: a human — the MCP client,
+standing in for one — accepting a flagged design as it is. The loop never fires
+it. Every transition is written to the run record (`kind: transition`).
+
+A caller whose design function reads only some parameters passes
+`allowed_actions`. The Form's pipeline call takes a pair count, a spacing and a
+channel, so it offers `reduce_pairs` and `switch_system`; a `relax_tm` the model
+picked there would design the identical thing again until the turn budget
+failed a good design, so the loop stops for a human instead and records both
+the model's choice and its own.
 
 What the model may say is `agent/models.py:DecisionModel` — closed keys, the
 `Action` enum, a signal enum, and a bounded `reason` that is refused if it
@@ -654,7 +678,11 @@ there is no need for a job queue, progress streaming or async machinery.
   sequences are never written anywhere inside the repository.
 - Tick **Run through the agent loop** to see the classifier's decision, the run
   record and why each step happened — including whether the model was consulted
-  at all.
+  at all. A design nobody screened is flagged without a model call. If the model
+  asks for fewer pairs or the other channel, the pipeline runs again with that
+  change and the run keeps the design the loop ended on; the GC/Tm window is
+  not relaxed here, because the pipeline ranks on it rather than rejecting, so
+  that would change nothing.
 - The sidebar always names the `systems.local.json` actually in use, and says
   loudly when the synthetic examples are loaded.
 
@@ -671,12 +699,14 @@ Switch **Interface** to *Chat* and talk to it:
 > 3 pair(s) designed against `mm10 chr5:142,906,255-142,906,754`.
 > ⚠️ No specificity screen ran for 3 of 3 pair(s) …
 
-> **too few passed, loosen the Tm**
-> **Applied:** Tm window 55.0-62.0 → 53.5-63.5 C
+> **make it 6 pairs at 20 nt spacing**
+> **Applied:** pairs → 6; minimum spacing → 20 nt
 
-The model does **exactly two things** in this path: turn a request into
-parameters, and choose which constraint gives when nothing passes. The design,
-the screens, the thermodynamics and the workbook are all deterministic.
+The model does **two things** in this path: turn a request into parameters
+(channel, pair count, spacing, which named index to screen against, whether
+the GC/Tm window is enforced), and answer questions by repeating the facts the
+software worked out (`diagnosis`). The design, the screens, the thermodynamics
+and the workbook are all deterministic.
 
 **The target is never the model's.** It is pulled out of the user's own words by
 `intent.extract_target`, a strict pattern in the harness — so a pasted run of
@@ -687,9 +717,18 @@ once a conversation is involved, so `tests/test_chat.py` attacks it directly.
 
 Numbers arriving from chat go through the same `clamp` as numbers typed into the
 form — less trustworthy, if anything. The model's sentence is shown as
-*"Model comment"* and never interpreted. And when a relaxation is asked for while
-the GC/Tm window is not being enforced, the reply says so, rather than reporting
-a change that had no effect.
+*"Model comment"* and never interpreted. And a request that changes none of the
+settings the design uses (*loosen the Tm*, say — the chat cannot widen the
+window, which only rejects windows when enforcement is on) is answered with what
+would change the design, instead of designing the same thing again under a
+comment promising a change.
+
+The intent the model fills in is three values — `change`, `explain`, `unclear` —
+plus the settings; there is no action field. `scripts/benchmark_chat.py` runs
+ten scripted chat turns on a synthetic sequence through exactly this path and
+scores what the model returned, with the time each turn took and whether the
+reply check passed. It is the quickest answer to "is the harness working on
+this machine" and "can a smaller model do this", and it touches no lab data.
 
 ## Driving it from Claude (MCP server)
 
@@ -709,7 +748,7 @@ python -m mypibypy mcp           # stdio server; an MCP client launches this its
 | `status` | which systems / loci files are loaded, whether they are placeholders, which screens are configured, where workbooks go |
 | `list_targets` | every locus, fusion and RNA target in the loci file, with its id |
 | `design_target` | design and screen one target by id; tiling, spacing and channel are parameters |
-| `decide_design` | resolve a design stopped at a decision point: `proceed`, `flag_for_review`, `fail`, `reduce_pairs` or `switch_system`, with a short reason; refused in any other state |
+| `decide_design` | resolve a design stopped at a decision point: `proceed`, `flag_for_review`, `fail`, `reduce_pairs` or `switch_system`, with a short reason; on a `flagged` design, `proceed` alone accepts it as it is; refused in any other state |
 | `write_order` | write one order workbook for designs that have **succeeded**; returns its path |
 
 Under MCP the client decides what to call and in what order, so the agent's fixed
@@ -718,14 +757,17 @@ machine the agent loop runs (`agent/states.py`): every design is a run with a
 state, `design_target` reports it, and a tool is refused unless the state allows
 it.
 
-- A design with a clean screen goes straight to `succeeded`. One with an
-  unscreened pair, a failing screen, a paralog-like arm or poor accessibility
-  stops in `decide` and says why. **Because no screen backend means every pair is
-  NOT SCREENED, a design made without one needs an explicit `decide_design`
-  `proceed` before it can be ordered.** The acceptance and the client's reason are
-  written into the run record and the workbook note.
+- A design with a clean screen goes straight to `succeeded`. One with a failing
+  screen, a paralog-like arm or poor accessibility stops in `decide` and says
+  why. One with an unscreened pair is `flagged` at once, with no decision asked
+  for: **no screen backend means every pair is NOT SCREENED, and a design made
+  without one needs an explicit `decide_design` `proceed` before it can be
+  ordered.** The acceptance and the client's reason are written into the run
+  record and the workbook note; any other change to a flagged design is a new
+  `design_target` call.
 - `write_order` refuses any design not in `succeeded`; `decide_design` refuses any
-  design not in `decide`. A refused call changes nothing and charges nothing.
+  design not in `decide`, except `proceed` on a `flagged` one. A refused call
+  changes nothing and charges nothing.
 - Revision is budgeted as in the loop: four designs per run, three relaxations,
   then the run fails rather than loosening further. Only `reduce_pairs` and
   `switch_system` are offered, because relaxing Tm/GC or widening the region
@@ -755,14 +797,18 @@ is refused, and fusions refuse tiling for the reason given above.
 **Registering it.** Use the conda env's Python, and put the env's `bin` on
 `PATH` so bowtie, blastn and RNAplfold are found. MCP clients start servers with
 a minimal environment. If the variables below are unset, the server uses
-`systems.local.json`, `loci.local.json` and `designs/` from this directory.
+`systems.local.json`, `loci.local.json` and `designs/` from this directory. The
+index paths are the ones you named in `indexes.local.json` (the Streamlit app
+reads that file; the MCP server takes them from these two variables), given as
+bowtie's index prefix, not a file.
 
 Claude Code:
 
 ```bash
 claude mcp add mypibypy --scope user \
   -e PATH="$HOME/miniforge3/envs/pifish-tools/bin:/usr/bin:/bin" \
-  -e MYPIBYPY_BOWTIE_INDEX=/path/to/hg38 \
+  -e MYPIBYPY_BOWTIE_INDEX="$HOME/genomes/hg38/hg38" \
+  -e MYPIBYPY_TRANSCRIPTOME_INDEX="$HOME/genomes/gencode_v50/transcripts" \
   -- "$HOME/miniforge3/envs/pifish-tools/bin/python" -m mypibypy mcp
 ```
 
@@ -776,8 +822,8 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
       "args": ["-m", "mypibypy", "mcp"],
       "env": {
         "PATH": "/Users/YOU/miniforge3/envs/pifish-tools/bin:/usr/bin:/bin",
-        "MYPIBYPY_BOWTIE_INDEX": "/path/to/hg38",
-        "MYPIBYPY_TRANSCRIPTOME_INDEX": "/path/to/gencode/transcripts"
+        "MYPIBYPY_BOWTIE_INDEX": "/Users/YOU/genomes/hg38/hg38",
+        "MYPIBYPY_TRANSCRIPTOME_INDEX": "/Users/YOU/genomes/gencode_v50/transcripts"
       }
     }
   }

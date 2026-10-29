@@ -8,18 +8,27 @@ loop is a driver over it:
     INTAKE --clamped--> DESIGN --designed--> EVALUATE
     EVALUATE --clear_pass--> SUCCEEDED
     EVALUATE --clear_fail--> FAILED
+    EVALUATE --unscreened--> FLAGGED                     (no model call)
     EVALUATE --needs_judgement--> DECIDE
     DECIDE --proceed / flag / fail--> SUCCEEDED / FLAGGED / FAILED
     DECIDE --apply--> RELAX --applied--> DESIGN          (the loop)
     RELAX --refused--> FAILED
+    FLAGGED --override--> SUCCEEDED                      (a human, never the loop)
     any live state --exhausted--> FAILED
+
+`unscreened` is deterministic: a pair with no specificity screen is a missing
+input, not a conflict between signals, so the run stops for a human without
+asking a model whose only defensible answer would be to stop for a human.
 
 Two things are enforced here rather than in the caller, because they are the
 two ways a run could be made to "succeed" by not stopping:
 
 * an event that is not in the table for the current state raises
   `IllegalTransition`. Nothing can skip SCREEN by jumping from DESIGN to a
-  verdict, and nothing leaves a terminal state.
+  verdict, and nothing leaves a terminal state -- with one exit, `override`
+  from FLAGGED, which is what FLAGGED is for: a human looked and accepted the
+  design as it is. The loop never fires it; the MCP server does, on an explicit
+  `proceed` from its client, and the override is recorded like any transition.
 * `apply` of a relaxing action is refused with `BudgetExceeded` once the
   relaxation budget is spent, and re-entering DESIGN is refused once the turn
   budget is. The caller turns that into a reported failure.
@@ -60,6 +69,8 @@ class Event(str, Enum):
     APPLIED = "applied"
     REFUSED = "refused"          # the action could not be applied
     EXHAUSTED = "exhausted"      # a hard budget ran out
+    UNSCREENED = "unscreened"    # no specificity screen ran: stop for a human, no model
+    OVERRIDE = "override"        # a human accepted a flagged design as it is
 
 
 TERMINAL = frozenset({State.SUCCEEDED, State.FAILED, State.FLAGGED})
@@ -70,6 +81,7 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     (State.DESIGN, Event.DESIGNED): State.EVALUATE,
     (State.EVALUATE, Event.CLEAR_PASS): State.SUCCEEDED,
     (State.EVALUATE, Event.CLEAR_FAIL): State.FAILED,
+    (State.EVALUATE, Event.UNSCREENED): State.FLAGGED,
     (State.EVALUATE, Event.NEEDS_JUDGEMENT): State.DECIDE,
     (State.DECIDE, Event.PROCEED): State.SUCCEEDED,
     (State.DECIDE, Event.FAIL): State.FAILED,
@@ -77,6 +89,8 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     (State.DECIDE, Event.APPLY): State.RELAX,
     (State.RELAX, Event.APPLIED): State.DESIGN,
     (State.RELAX, Event.REFUSED): State.FAILED,
+    # The one way out of a terminal state: a human's explicit acceptance.
+    (State.FLAGGED, Event.OVERRIDE): State.SUCCEEDED,
     # A budget can end the run from any live state.
     **{(s, Event.EXHAUSTED): State.FAILED for s in State if s not in TERMINAL},
 }
@@ -188,5 +202,6 @@ def mermaid() -> str:
             continue
         lines.append(f"    {s.value} --> {t.value}: {e.value}")
     lines.append("    note right of intake: exhausted (a hard budget) -> failed, "
-                 "from any live state")
+                 "from any live state; override is a human's acceptance, "
+                 "never the loop's")
     return "\n".join(lines)

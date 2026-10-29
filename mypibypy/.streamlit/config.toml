@@ -1,0 +1,10 @@
+[client]
+# Hide the Deploy button and the Rerun/Clear cache/Print/Record menu.
+toolbarMode = "minimal"
+
+[server]
+# One fixed port. With the default port Streamlit silently moves to the next
+# free one when 8501 is busy, which left six suspended servers on 8501-8506 and
+# the live one on 8507 while the browser tab stayed on 8501. A pinned port fails
+# loudly instead. .claude/launch.json uses the same number.
+port = 8533

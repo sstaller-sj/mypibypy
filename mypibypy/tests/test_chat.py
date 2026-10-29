@@ -17,16 +17,19 @@ from __future__ import annotations
 
 import pytest
 
+from mypibypy.agent.context import ScreenStatus, build_chat_context
 from mypibypy.agent import Action, DesignParameters, ParameterRefused, ScriptedClient
 from mypibypy.agent.intent import (
-    CHAT_RELAXATIONS,
     CHAT_SYSTEM_PROMPT,
     INTENTS,
     UNCHANGED,
     UNCHANGED_INT,
     Intent,
     apply_intent,
+    chat_request,
     extract_target,
+    redact_sequences,
+    unreadable_sequence_chars,
     intent_schema,
 )
 
@@ -34,9 +37,9 @@ KEYS = ("cy5", "cy3")
 
 
 def payload(**over):
-    base = {"intent": "design", "system": UNCHANGED, "n_pairs": UNCHANGED_INT,
+    base = {"intent": "change", "system": UNCHANGED, "n_pairs": UNCHANGED_INT,
             "min_spacing": UNCHANGED_INT, "enforce_window": UNCHANGED,
-            "relax": "none", "note": "ok"}
+            "screen": UNCHANGED, "note": "ok"}
     base.update(over)
     return base
 
@@ -127,18 +130,17 @@ class TestExtractTarget:
 class TestIntentValidation:
     def test_a_well_formed_intent_parses(self):
         intent = Intent.from_payload(payload(system="cy5", n_pairs=6), KEYS)
-        assert intent.intent == "design" and intent.system == "cy5"
+        assert intent.intent == "change" and intent.system == "cy5"
         assert intent.n_pairs == 6 and intent.wants_design
 
     def test_a_missing_field_is_refused(self):
         bad = payload()
-        del bad["relax"]
+        del bad["screen"]
         with pytest.raises(ParameterRefused, match="missing"):
             Intent.from_payload(bad, KEYS)
 
     @pytest.mark.parametrize("field,value", [
-        ("intent", "obliterate"), ("relax", "relax_everything"),
-        ("enforce_window", "maybe"),
+        ("intent", "obliterate"), ("intent", "adjust"), ("enforce_window", "maybe"),
     ])
     def test_a_value_outside_an_enum_is_refused(self, field, value):
         with pytest.raises(ParameterRefused, match=field):
@@ -156,10 +158,16 @@ class TestIntentValidation:
         enum = intent_schema(KEYS)["properties"]["system"]["enum"]
         assert set(enum) == {"cy5", "cy3", UNCHANGED}
 
-    def test_intents_and_relaxations_are_closed_sets(self):
+    def test_intents_are_a_closed_set_of_three(self):
+        """Every enum is another field a small model must get right on every
+        turn. design/adjust were one thing to the software; `relax` offered a
+        single action that is just a pair count. Both are gone."""
         schema = intent_schema(KEYS)["properties"]
-        assert schema["intent"]["enum"] == list(INTENTS)
-        assert schema["relax"]["enum"] == list(CHAT_RELAXATIONS)
+        assert schema["intent"]["enum"] == list(INTENTS) == ["change", "explain",
+                                                             "unclear"]
+        assert "relax" not in schema
+        assert set(schema) == {"intent", "system", "n_pairs", "min_spacing",
+                               "enforce_window", "screen", "note"}
 
 
 # --- Applying an intent ----------------------------------------------------
@@ -184,19 +192,30 @@ class TestApplyIntent:
         params, _ = apply_intent(intent, DesignParameters(), KEYS)
         assert params.n_pairs == 50
         # And beyond the bound it is pulled back, with the override recorded.
-        over = Intent(intent="design", n_pairs=50)
+        over = Intent(intent="change", n_pairs=50)
         over.n_pairs = 9999            # past the schema, as if validation were bypassed
         params, changes = apply_intent(over, DesignParameters(), KEYS)
         assert params.n_pairs == 50
         assert any("permitted range" in c for c in changes)
 
-    def test_a_relaxation_uses_the_fixed_step(self):
-        intent = Intent.from_payload(payload(intent="adjust", relax="relax_tm"), KEYS)
-        params, changes = apply_intent(intent, DesignParameters(tm_min=55, tm_max=62),
-                                       KEYS)
-        assert (params.tm_min, params.tm_max) == (53.5, 63.5)
-        assert any("Tm window" in c for c in changes)
-        assert intent.relax_action is Action.RELAX_TM
+    def test_fewer_pairs_is_a_pair_count_not_an_action(self):
+        """What `relax: reduce_pairs` used to do, said directly."""
+        intent = Intent.from_payload(payload(n_pairs=4), KEYS)
+        params, changes = apply_intent(intent, DesignParameters(n_pairs=5), KEYS)
+        assert params.n_pairs == 4
+        assert changes == ["pairs → 4"]
+
+    def test_no_intent_field_carries_an_action(self):
+        """The chat designs from pair count, spacing and channel only. An action
+        field would let the model ask for relax_tm, which here would report
+        "Applied" and change nothing -- or for proceed/fail, which are the
+        loop's to choose. There is none, under any name."""
+        props = intent_schema(KEYS, ("hg38",))["properties"]
+        action_values = {a.value for a in Action}
+        for name, spec in props.items():
+            assert not (set(spec.get("enum", [])) & action_values), name
+        with pytest.raises(ParameterRefused, match="unexpected keys"):
+            Intent.from_payload(payload(relax="reduce_pairs"), KEYS)
 
     def test_enforce_window_can_be_switched_on_and_off(self):
         on = Intent.from_payload(payload(enforce_window="on"), KEYS)
@@ -206,15 +225,6 @@ class TestApplyIntent:
         off = Intent.from_payload(payload(enforce_window="off"), KEYS)
         back, changes = apply_intent(off, params, KEYS)
         assert back.enforce_window is False
-
-    def test_switch_system_is_not_reachable_from_chat(self):
-        """Picking a channel is explicit; the user names it or the form holds it."""
-        assert Action.SWITCH_SYSTEM.value not in CHAT_RELAXATIONS
-
-    def test_terminal_actions_are_not_reachable_from_chat(self):
-        """Proceed/fail/flag are the loop's to choose, not the chat's."""
-        for action in (Action.PROCEED, Action.FAIL, Action.FLAG_FOR_REVIEW):
-            assert action.value not in CHAT_RELAXATIONS
 
 
 # --- The scripted round trip ------------------------------------------------
@@ -233,3 +243,115 @@ class TestScriptedRoundTrip:
     def test_an_exhausted_client_reports_rather_than_inventing(self):
         data, error, _ = ScriptedClient().structured("s", "u", intent_schema(KEYS))
         assert data is None and "no structured reply" in error
+
+
+# --- Pasted sequence: the user's own text, kept from the model -------------
+
+SEQ = "ACGT" * 20
+
+
+class TestPastedSequence:
+    def test_inline_run_is_a_sequence_target(self):
+        t = extract_target(f"design for {SEQ} in cy5")
+        assert t.kind == "sequence" and t.sequence == SEQ
+
+    def test_fasta_wrapped_over_lines_and_rna_read_as_dna(self):
+        text = ">tx1 some description\n" + SEQ[:60].replace("T", "U") + "\n" + SEQ[60:] + "\n"
+        assert extract_target(text).sequence == SEQ
+
+    def test_too_short_or_prose_is_not_a_target(self):
+        assert not extract_target("ACGT" * 5).found
+        assert not extract_target("act cat a at").found
+
+    def test_region_wins_over_a_sequence(self):
+        assert extract_target(f"chr7:1-100 {SEQ}").kind == "genomic"
+
+    def test_the_model_never_sees_the_sequence(self):
+        red = redact_sequences(f"design for {SEQ} in cy5")
+        assert SEQ[:20] not in red and "80 nt" in red
+
+    def test_the_form_refuses_unreadable_characters(self):
+        assert unreadable_sequence_chars(">h\nACGN 12") == "N"
+        assert unreadable_sequence_chars(SEQ) == ""
+
+
+class TestChatRequestCarriesTheSession:
+    """Each chat turn is a separate model call. Without the current design in
+    the request, "can you make a set of 4" after a pasted sequence read as a
+    request with no target, and the model asked for one. What the context
+    holds is tested in test_chat_context.py; this is the request around it."""
+
+    SEQ = "ACGT" * 30
+
+    def test_follow_up_sees_the_held_target_and_settings(self):
+        ctx = build_chat_context("can you make a set of 4",
+                                 DesignParameters(system="cy3", n_pairs=1),
+                                 "pasted sequence (420 nt)")
+        text = chat_request("can you make a set of 4", ctx)
+        assert '"target": "pasted sequence (420 nt)"' in text
+        assert '"n_pairs": 1' in text
+        assert text.endswith("USER MESSAGE:\ncan you make a set of 4")
+
+    def test_still_no_bases_reach_the_model(self):
+        message = f"design 4 pairs for {self.SEQ}"
+        ctx = build_chat_context(message, DesignParameters(system="cy3"),
+                                 f"pasted sequence ({len(self.SEQ)} nt)")
+        text = chat_request(message, ctx)
+        assert self.SEQ not in text
+        assert "[pasted sequence, 120 nt]" in text
+
+    def test_prompt_tells_the_model_to_continue_from_it(self):
+        assert "CURRENT DESIGN" in CHAT_SYSTEM_PROMPT
+        assert "Do not ask for a target or a channel" in CHAT_SYSTEM_PROMPT
+        assert "pair_details" in CHAT_SYSTEM_PROMPT
+
+
+class TestChatRequestCarriesRecentTurns:
+    """"no, for the specificity screen" means nothing without the turn before
+    it. The model was sent only the message and answered the wrong question."""
+
+    SEQ = "ACGT" * 30
+    HISTORY = [
+        {"role": "user", "text": f"this is the target {SEQ}"},
+        {"role": "assistant", "text": "No specificity screen ran for 1 pair."},
+        {"role": "user", "text": "how do I give that to you"},
+        {"role": "assistant", "text": "Paste the DNA sequence or a region."},
+    ]
+
+    def ctx(self, **kw):
+        return build_chat_context("x", DesignParameters(system="cy3"),
+                                  "pasted sequence (120 nt)", **kw)
+
+    def test_recent_turns_go_before_the_message(self):
+        text = chat_request("no, for the specificity screen", self.ctx(),
+                            self.HISTORY)
+        recent = text.index("RECENT CONVERSATION")
+        assert recent < text.index("USER MESSAGE")
+        assert "user: how do I give that to you" in text
+        assert "assistant: Paste the DNA sequence or a region." in text
+
+    def test_history_is_redacted_too(self):
+        text = chat_request("x", self.ctx(), self.HISTORY)
+        assert self.SEQ not in text
+        assert "[pasted sequence, 120 nt]" in text
+
+    def test_history_is_bounded(self):
+        long = [{"role": "user", "text": f"turn {i} " + "word " * 500}
+                for i in range(20)]
+        text = chat_request("x", self.ctx(), long)
+        assert "turn 13 " not in text and "turn 14 " in text
+        assert len(text) < 6000
+
+    def test_no_history_no_block(self):
+        assert "RECENT CONVERSATION" not in chat_request("x", self.ctx())
+
+    def test_the_context_says_whether_the_screen_is_on_and_how(self):
+        off = chat_request("x", self.ctx())
+        assert '"on": false' in off and "bowtie index (optional)" in off
+        on = chat_request("x", self.ctx(screen=ScreenStatus(
+            on=True, against="hg38", available=["hg38 (genome)"])))
+        assert '"against": "hg38"' in on and "hg38 (genome)" in on
+
+    def test_the_prompt_explains_the_screen(self):
+        assert "bowtie index (optional)" in CHAT_SYSTEM_PROMPT
+        assert "RECENT CONVERSATION" in CHAT_SYSTEM_PROMPT

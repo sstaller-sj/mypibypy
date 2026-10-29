@@ -55,6 +55,8 @@ from .agent.tools import (FORBIDDEN_TOOL_PARAMETERS, WindowStats,
                           screen_evidence)
 from .cli import design_warnings, example_warnings
 from .design import DEFAULT_MIN_SPACING_NT, PADS_DIRECT
+from .diagnosis import (NOT_PREVIEWABLE, PREVIEW_CAVEAT, diagnose, preview_change,
+                        try_changes)
 from .expression import ENV_EXPRESSION, resolve_expression
 from .fold import not_evaluated as fold_not_evaluated
 from .loci import load_fusions, load_loci, load_rna_targets, resolve_loci_path
@@ -248,7 +250,10 @@ def result_summary(res) -> dict:
         "n_pairs": res.n_pairs,
         "pairs": [pair_summary(i, p, s, a, res.folding_at(i - 1))
                   for i, (p, s, a) in enumerate(res.rows(), start=1)],
-    }
+    } | ({"repacked": (f"greedy placement fit only {res.repacked_from}; the pairs "
+                       f"were re-laid out to fit {res.n_pairs}, using some "
+                       f"lower-ranked windows")}
+         if res.repacked_from else {})
 
 
 # --- the session -------------------------------------------------------------
@@ -408,7 +413,18 @@ class Session:
         stored = self._get(design_id)
         with stored.lock:
             m, record = stored.machine, stored.record
-            if Event.APPLY not in m.legal():
+            # A flagged design stopped for a human. The client, standing in for
+            # one, may accept it as it is -- the machine's single exit from a
+            # terminal state -- and nothing else: a revision is a new run.
+            overriding = m.state is State.FLAGGED
+            if overriding and action != Action.PROCEED.value:
+                raise ValueError(
+                    f"{design_id} is 'flagged': it stopped for a human "
+                    f"({stored.why}). From here the only decision is 'proceed', "
+                    f"which accepts the design as it is and records your reason "
+                    f"against the order; for anything else call design_target "
+                    f"again, which is a new run.")
+            if not overriding and Event.APPLY not in m.legal():
                 raise ValueError(
                     f"{design_id} is in state {m.state.value!r}, and decide_design "
                     f"only applies while a design is in 'decide'. "
@@ -430,6 +446,15 @@ class Session:
                        action=decision.action.value,
                        primary_signal=decision.primary_signal,
                        prompted_because=stored.why, source="mcp-client")
+
+            if overriding:
+                fire_logged(m, record, Event.OVERRIDE)
+                stored.warnings.append(
+                    f"{design_id} stopped for a human ({stored.why}) and was "
+                    f"accepted by the MCP client as it is; client's reason: "
+                    f"{decision.reason}")
+                self._conclude(stored, decision.reason)
+                return self._payload(stored)
 
             terminal = {Action.PROCEED: Event.PROCEED, Action.FAIL: Event.FAIL,
                         Action.FLAG_FOR_REVIEW: Event.FLAG}
@@ -485,6 +510,49 @@ class Session:
                "primaries": sum(2 * r.n_pairs for r in results)}
         if warnings:
             out["warnings"] = warnings
+        return out
+
+    def diagnose_design(self, design_id: str) -> dict:
+        """What a design came out as and, if it is short, what would help.
+
+        Read-only: the facts and previews come from `diagnosis`, the layer the
+        Streamlit chat reads too, and nothing here moves the run or its budget.
+        """
+        stored = self._get(design_id)
+        with stored.lock:
+            facts = diagnose(stored.results, stored.params)
+            previews = try_changes(stored.results, stored.params)
+            out = {"design_id": design_id, "state": stored.state.value,
+                   "facts": [{"topic": f.topic, "text": f.text} for f in facts]}
+        if previews:
+            out["what_if"] = [_what_if(p) for p in previews]
+            out["what_if_note"] = PREVIEW_CAVEAT + " " + _HOW_TO_APPLY
+        return out
+
+    def try_change(self, design_id: str, n_pairs: int | None = None,
+                   min_spacing: int | None = None) -> dict:
+        """Preview a pair count and/or spacing on a design without designing it.
+
+        Read-only, like `diagnose_design`. The numbers are clamped exactly as
+        `design_target` clamps them, so a preview never shows a value the
+        design would not use.
+        """
+        stored = self._get(design_id)
+        if n_pairs is None and min_spacing is None:
+            raise ValueError("give n_pairs, min_spacing or both to preview")
+        with stored.lock:
+            params = stored.params
+            new, clamps = clamp(replace(
+                params,
+                n_pairs=params.n_pairs if n_pairs is None else n_pairs,
+                min_spacing=params.min_spacing if min_spacing is None else min_spacing))
+            preview = preview_change(stored.results, params, new)
+        if preview is None:
+            raise ValueError(f"{design_id} cannot be previewed: {NOT_PREVIEWABLE}")
+        out = {"design_id": design_id, "what_if": _what_if(preview),
+               "note": PREVIEW_CAVEAT + " " + _HOW_TO_APPLY}
+        if clamps:
+            out["warnings"] = [str(c) for c in clamps]
         return out
 
     # -- the machine's side of the tools --------------------------------------
@@ -591,6 +659,11 @@ class Session:
         if s is State.DECIDE:
             return (f"call decide_design with one of "
                     f"{[a.value for a in MCP_ACTIONS]} ({stored.why})")
+        if s is State.FLAGGED:
+            return (f"it stopped for a human ({stored.why}); decide_design "
+                    f"'proceed' with your reason accepts it as it is and is "
+                    f"recorded against the order, or call design_target again "
+                    f"for a fresh run")
         return ("the run is over and cannot be reopened; call design_target again "
                 "for a fresh run")
 
@@ -633,6 +706,18 @@ class Session:
         rec.RunStore().append(record)
 
 
+#: Previews do not revise a design: spacing is not an `Action`, and a preview
+#: should not spend the run's budget. A change is used by designing afresh.
+_HOW_TO_APPLY = ("To use a change, call design_target again with that n_pairs "
+                 "and min_spacing; it is a new run.")
+
+
+def _what_if(p) -> dict:
+    return {"change": p.change, "n_pairs": p.params.n_pairs,
+            "min_spacing": p.params.min_spacing, "pairs_placed": p.pairs_placed,
+            "pairs_requested": p.pairs_requested, "text": p.text}
+
+
 def out_dir() -> Path:
     return Path(os.environ.get(ENV_OUT_DIR) or (_checkout_dir() / "designs")).expanduser()
 
@@ -653,9 +738,14 @@ are addressed by id only; you cannot supply a region, accession or sequence, and
 results never include oligo sequences -- those go only into the order workbook \
 that `write_order` saves locally. Every design is a run with a state, and \
 `design_target` reports it. `succeeded` designs can be ordered. A design in \
-`decide` stopped on a real tradeoff or an unscreened pair: resolve it with \
-`decide_design`, which is refused in any other state. `write_order` refuses a \
-design that has not succeeded. Report any "NOT SCREENED" specificity or \
+`decide` stopped on a real tradeoff: resolve it with `decide_design`. A design \
+in `flagged` stopped for a human, usually because no specificity screen ran; \
+`decide_design` with `proceed` and your reason accepts it as it is, and the \
+acceptance is recorded against the order. `decide_design` is refused in any \
+other state. `write_order` refuses a design that has not succeeded. To explain a design or troubleshoot one that \
+placed too few pairs, call `diagnose_design`, and `try_change` to preview a \
+pair count or spacing; quote their sentences rather than working the numbers \
+out yourself. Report any "NOT SCREENED" specificity or \
 placeholder-input warning to the user verbatim: it means no off-target screen \
 was run, not that the design passed one.
 """
@@ -665,23 +755,45 @@ def build_server(session: Session | None = None):
     """The MCP server over a `Session`. Imports the SDK here so the rest of this
     module, and its tests, work without it installed."""
     from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import ToolAnnotations
 
     session = session or Session.from_environment()
     server = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS)
     read_only = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 
+    def refusing(fn, *args, **kwargs):
+        """Run a `Session` method so that a refusal reaches the client with its reason.
+
+        The SDK treats any exception other than `ToolError` as a crash: the
+        model is told only `Error executing tool <name>` and the text stays in
+        the server log. Every refusal here is deliberate and carries the hint
+        the client needs next -- "call list_targets for the ids", "only applies
+        while a design is in 'decide'", "Designs do not survive a server
+        restart" -- so it is re-raised as a `ToolError`. Verified over stdio:
+        without this, `write_order` on an unknown id came back as the generic
+        line and the hint was lost, so the client could not correct itself.
+        A genuine bug (anything else) still crashes, generically.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except (ValueError, RuntimeError, OSError) as exc:
+            # ValueError covers ParameterRefused and FusionIsSinglePair;
+            # RuntimeError covers IllegalTransition, LociNotConfigured and a
+            # transcript fetch that failed; OSError a reference service down.
+            raise ToolError(str(exc)) from exc
+
     @server.tool(annotations=read_only)
     def status() -> dict:
         """Which systems and loci files are loaded, whether they are placeholders,
         which specificity screens are configured, and where workbooks go."""
-        return session.status()
+        return refusing(session.status)
 
     @server.tool(annotations=read_only)
     def list_targets() -> dict:
         """Every target in the lab's loci file: genomic loci, fusion junctions and
         RNA transcripts, each with the id that design_target takes."""
-        return session.list_targets()
+        return refusing(session.list_targets)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                                              openWorldHint=True))
@@ -699,9 +811,9 @@ def build_server(session: Session | None = None):
         to fusion antisense pairs only. Returns names, coordinates, GC/Tm, QC
         flags and screen verdicts per pair, plus a design_id for write_order.
         """
-        return session.design_target(target_id, n_pairs=n_pairs,
-                                     min_spacing=min_spacing, system=system,
-                                     screen=screen, pad_assignment=pad_assignment)
+        return refusing(session.design_target, target_id, n_pairs=n_pairs,
+                        min_spacing=min_spacing, system=system,
+                        screen=screen, pad_assignment=pad_assignment)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                                              idempotentHint=False, openWorldHint=False))
@@ -713,15 +825,38 @@ def build_server(session: Session | None = None):
                                               "thermodynamics", "composition",
                                               "geometry", "capacity"] = "specificity",
                       ) -> dict:
-        """Resolve a design whose state is 'decide' (design_target says why).
+        """Resolve a design whose state is 'decide' (design_target says why), or
+        accept one whose state is 'flagged'.
 
         proceed accepts it as it is, and your reason is recorded against the order;
         flag_for_review and fail end the run; reduce_pairs and switch_system
-        revise it and design again. At most three relaxations and four designs per
-        run. reason is one or two plain sentences -- never a sequence. Refused
-        unless the design is in 'decide'.
+        revise it and design again. From 'flagged' -- the design stopped for a
+        human, usually because no specificity screen ran -- only proceed is
+        allowed; a revision is a new design_target call. At most three relaxations
+        and four designs per run. reason is one or two plain sentences -- never a
+        sequence. Refused in any other state.
         """
-        return session.decide_design(design_id, action, reason, primary_signal)
+        return refusing(session.decide_design, design_id, action, reason,
+                        primary_signal)
+
+    @server.tool(annotations=read_only)
+    def diagnose_design(design_id: str) -> dict:
+        """Explain a design: why it placed fewer pairs than asked, how its windows
+        sit against the GC/Tm window, whether its pairs were screened, how folded
+        its primaries are. Each fact is a sentence worked out by the software --
+        quote it rather than recomputing it. When pairs are missing, what_if
+        previews smaller spacings and fewer pairs. Changes nothing."""
+        return refusing(session.diagnose_design, design_id)
+
+    @server.tool(annotations=read_only)
+    def try_change(design_id: str, n_pairs: int | None = None,
+                   min_spacing: int | None = None) -> dict:
+        """Preview how many pairs a design would place with a different n_pairs
+        and/or min_spacing (nt), without designing it. Placement only: the screen
+        and folding check run when you design it with design_target. Not for
+        fusions. Changes nothing."""
+        return refusing(session.try_change, design_id, n_pairs=n_pairs,
+                        min_spacing=min_spacing)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                                              idempotentHint=False, openWorldHint=False))
@@ -729,7 +864,7 @@ def build_server(session: Session | None = None):
         """Write one order workbook for the given design_ids (from design_target
         in this session). Refused for any design whose state is not 'succeeded'. The server names the file and saves it in the
         workbook directory shown by status; the path is returned."""
-        return session.write_order(design_ids)
+        return refusing(session.write_order, design_ids)
 
     return server
 

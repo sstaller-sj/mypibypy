@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to indexes.local.json and point each path at a bowtie v1 index basename (the part before .1.ebwt). Names are what the Form and the chat offer.",
+  "indexes": {
+    "hg38":    {"path": "/data/genomes/hg38", "kind": "genome", "description": "human GRCh38"},
+    "mm10":    {"path": "/data/genomes/mm10", "kind": "genome", "description": "mouse GRCm38"},
+    "hg38-tx": {"path": "/data/tx/gencode_human", "kind": "transcriptome", "description": "GENCODE human transcripts"}
+  }
+}

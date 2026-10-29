@@ -296,8 +296,63 @@ ENV_CLIENT_KIND = "MYPIBYPY_DECISION_CLIENT"
 THINK = False
 
 
-NUM_CTX = 4096
+#: Context window, prompt and reply together. Was 4096, measured too small: a
+#: chat turn after ten lines of conversation sent a 4001-token prompt, leaving
+#: the reply 95 tokens -- cut off mid-`note` (done_reason "length"), so the JSON
+#: never closed and the user saw "not valid JSON" three times. The chat prompt
+#: alone measures 2,900-3,400 tokens with a design held. 8192 keeps the KV cache
+#: bounded (the reason for setting one at all) with room for history and reply.
+NUM_CTX = 8192
 NUM_PREDICT = 512
+
+#: Sampling, set explicitly rather than inherited from the Modelfile. The one
+#: Ollama ships for qwen3.5 carries `presence_penalty 1.5`, `top_k 20` and
+#: `top_p 0.95`, and this client used to override only the temperature. A
+#: presence penalty still moves logits under greedy decoding and under the
+#: `format` grammar, and it penalises tokens seen in the last 64 tokens of
+#: context -- at the start of a reply, the end of the prompt: the very numbers
+#: `note` is told to repeat as written. Measured on the same four chat turns,
+#: twice each, idle machine: with the stock options "why did I only get 4?" was
+#: refused by `reply_check` on both repeats (it said windows were "rejected"
+#: while the window was not enforced); with these, every reply passed first
+#: time. Speed was identical (8.6 s against 8.7 s per turn), so this is a
+#: correctness setting, not a tuning preference.
+SAMPLING = {"temperature": 0.0, "top_k": 1, "top_p": 1.0,
+            "presence_penalty": 0.0, "repeat_penalty": 1.0}
+
+#: How long Ollama keeps the model resident after a request. The server default
+#: is five minutes, after which the next call pays the load again: 12.6 s against
+#: 4.5 s warm, measured. Sent per request, so no server configuration is needed:
+#: a working session stays warm and the 5.7 GB is released afterwards. Override
+#: with $MYPIBYPY_OLLAMA_KEEP_ALIVE (Ollama's duration syntax; "0" unloads at
+#: once, "-1" pins the model).
+KEEP_ALIVE = "30m"
+ENV_KEEP_ALIVE = "MYPIBYPY_OLLAMA_KEEP_ALIVE"
+
+
+def transport_error(host: str, model: str, timeout: float, exc: BaseException) -> str:
+    """What went wrong with the HTTP call, and what to do about it.
+
+    Three different failures used to share one message ending in `ollama
+    serve`: a server that is not running, a model that is not pulled, and a
+    server that is up but did not answer in time. The last is the common case
+    on a laptop whose memory is full -- measured as two 120 s timeouts on chat
+    turns that take 9 s on an idle machine -- and telling that user to start
+    the server sends them the wrong way.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        hint = (f"; is the model pulled? `ollama pull {model}`" if exc.code == 404
+                else "")
+        return f"{host} returned HTTP {exc.code}: {exc.reason}{hint}"
+    reason = getattr(exc, "reason", exc)
+    if (isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
+            or "timed out" in str(exc).lower()):
+        return (f"Ollama at {host} did not answer within {timeout:.0f} s. The server "
+                f"is up but slow: usually the machine is short of memory (check "
+                f"`ollama ps` and swap, and close other model or genome-index "
+                f"processes), or {model} is still loading")
+    return (f"could not reach Ollama at {host} ({exc}). Is the server running? "
+            f"`ollama serve`, then `ollama pull {model}`")
 
 
 class OllamaDecisionClient:
@@ -314,13 +369,14 @@ class OllamaDecisionClient:
 
     def __init__(self, model: str | None = None, host: str | None = None,
                  timeout: float = 120.0, max_attempts: int = 3,
-                 temperature: float = 0.0):
+                 temperature: float = 0.0, keep_alive: str | None = None):
         self.model = model or os.environ.get(ENV_LOCAL_MODEL, DEFAULT_LOCAL_MODEL)
         self.host = (host or os.environ.get(ENV_OLLAMA_HOST,
                                             DEFAULT_OLLAMA_HOST)).rstrip("/")
         self.timeout = timeout
         self.max_attempts = max(1, max_attempts)
         self.temperature = temperature
+        self.keep_alive = keep_alive or os.environ.get(ENV_KEEP_ALIVE, KEEP_ALIVE)
         self.name = f"ollama:{self.model}"
 
     # -- request -----------------------------------------------------------
@@ -345,10 +401,13 @@ class OllamaDecisionClient:
             "format": schema or ACTION_SCHEMA,
             # See THINK. Non-negotiable.
             "think": THINK,
-            # Bounded on purpose: an unbounded context allocates a large KV
+            # Every sampler setting pinned, not inherited (see SAMPLING), and
+            # bounded on purpose: an unbounded context allocates a large KV
             # cache, and unbounded generation can run until the timeout.
-            "options": {"temperature": self.temperature,
+            "options": {**SAMPLING, "temperature": self.temperature,
                         "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT},
+            # See KEEP_ALIVE: the model stays resident between turns.
+            "keep_alive": self.keep_alive,
             "messages": [
                 {"role": "system", "content": self.system_prompt(system, schema)},
                 {"role": "user", "content": evidence},
@@ -377,10 +436,16 @@ class OllamaDecisionClient:
         for attempt in range(1, self.max_attempts + 1):
             try:
                 payload = self._post(body)
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-                return None, f"could not reach Ollama at {self.host}: {exc}", \
+            except (urllib.error.URLError, OSError) as exc:
+                return None, transport_error(self.host, self.model, self.timeout, exc), \
                     time.time() - started
             content = ((payload.get("message") or {}).get("content") or "").strip()
+            if payload.get("done_reason") == "length":
+                # Said for what it is: retrying the same request cannot help.
+                return None, (
+                    f"the reply was cut off at the model's length limit (prompt "
+                    f"{payload.get('prompt_eval_count', '?')} tokens, context "
+                    f"{NUM_CTX}, reply limit {NUM_PREDICT})"), time.time() - started
             if not content:
                 last = f"attempt {attempt}: no content returned"
                 continue
@@ -399,18 +464,14 @@ class OllamaDecisionClient:
         for attempt in range(1, self.max_attempts + 1):
             try:
                 payload = self._post(body)
-            except urllib.error.HTTPError as exc:
+            except (urllib.error.URLError, OSError) as exc:
+                # HTTPError is a URLError; `transport_error` tells a dead
+                # server, a missing model and a slow server apart. None of them
+                # is retried: the next attempt would end the same way.
                 return ModelReply(decision=None, model=self.model, attempts=attempt,
                                   latency_s=time.time() - started,
-                                  error=f"{self.host} returned HTTP {exc.code}: "
-                                        f"{exc.reason}")
-            except (urllib.error.URLError, OSError) as exc:
-                return ModelReply(
-                    decision=None, model=self.model, attempts=attempt,
-                    latency_s=time.time() - started,
-                    error=(f"could not reach Ollama at {self.host} ({exc}). Is the "
-                           f"server running? `ollama serve`, then `ollama pull "
-                           f"{self.model}`"))
+                                  error=transport_error(self.host, self.model,
+                                                        self.timeout, exc))
             except json.JSONDecodeError as exc:
                 last_error = f"Ollama response was not JSON: {exc}"
                 continue

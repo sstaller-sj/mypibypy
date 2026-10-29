@@ -10,9 +10,30 @@ from test_agent import (candidates, make_design, region, relax_payload,  # noqa:
 
 
 class TestTable:
-    def test_terminal_states_have_no_exits(self):
-        for state in TERMINAL:
-            assert legal_events(state) == frozenset()
+    def test_terminal_states_have_no_exits_but_the_human_override(self):
+        """SUCCEEDED and FAILED are final. FLAGGED waits for a human, and the
+        one thing a human may do with it from here is accept it as it is."""
+        assert legal_events(State.SUCCEEDED) == frozenset()
+        assert legal_events(State.FAILED) == frozenset()
+        assert legal_events(State.FLAGGED) == frozenset({Event.OVERRIDE})
+        assert State.FLAGGED in TERMINAL, "the loop still stops there"
+
+    def test_an_unscreened_design_stops_without_a_decision_state(self):
+        m = Machine()
+        for e in (Event.CLAMPED, Event.DESIGNED, Event.UNSCREENED):
+            m.fire(e)
+        assert m.state is State.FLAGGED and m.finished
+        m.fire(Event.OVERRIDE)                  # a human accepted it
+        assert m.state is State.SUCCEEDED
+        with pytest.raises(IllegalTransition):
+            m.fire(Event.OVERRIDE)              # succeeded is final
+
+    def test_the_override_is_not_a_way_out_of_failure(self):
+        m = Machine()
+        for e in (Event.CLAMPED, Event.DESIGNED, Event.CLEAR_FAIL):
+            m.fire(e)
+        with pytest.raises(IllegalTransition):
+            m.fire(Event.OVERRIDE)
 
     def test_every_live_state_can_be_exhausted(self):
         for state in State:
@@ -46,6 +67,8 @@ class TestTable:
     def test_diagram_mentions_every_non_budget_edge(self):
         text = mermaid()
         assert "evaluate --> decide: needs_judgement" in text
+        assert "evaluate --> flagged: unscreened" in text
+        assert "flagged --> succeeded: override" in text
 
 
 class TestBudgets:

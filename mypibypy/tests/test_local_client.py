@@ -24,6 +24,9 @@ from mypibypy.agent import ACTION_SCHEMA, Action, Decision, build_client
 from mypibypy.agent.client import (
     DEFAULT_LOCAL_MODEL,
     DEFAULT_OLLAMA_HOST,
+    ENV_KEEP_ALIVE,
+    KEEP_ALIVE,
+    SAMPLING,
     THINK,
     AnthropicDecisionClient,
     OllamaDecisionClient,
@@ -131,6 +134,45 @@ class TestRequestShape:
         assert body["messages"][1] == {"role": "user", "content": "EVIDENCE HERE"}
 
 
+class TestSamplerIsExplicit:
+    """The Modelfile Ollama pulls for qwen3.5 sets presence_penalty 1.5, top_k 20
+    and top_p 0.95. With only the temperature overridden, one of four chat
+    turns was refused by `reply_check` on both repeats; with every setting
+    pinned, none was, at identical speed. So nothing is left to the Modelfile."""
+
+    def test_every_sampler_setting_is_in_the_request(self):
+        options = OllamaDecisionClient().request_body("s", "e")["options"]
+        for name, value in SAMPLING.items():
+            assert options[name] == value, name
+
+    def test_the_penalties_are_off(self):
+        assert SAMPLING["presence_penalty"] == 0.0
+        assert SAMPLING["repeat_penalty"] == 1.0
+
+    def test_decoding_is_greedy(self):
+        assert SAMPLING["temperature"] == 0.0 and SAMPLING["top_k"] == 1
+
+    def test_a_requested_temperature_still_wins(self):
+        body = OllamaDecisionClient(temperature=0.3).request_body("s", "e")
+        assert body["options"]["temperature"] == 0.3
+
+
+class TestKeepAlive:
+    """Ollama unloads after five idle minutes; the next call then pays the load
+    (12.6 s against 4.5 s warm). The request asks it to stay."""
+
+    def test_keep_alive_is_sent_with_every_request(self, monkeypatch):
+        monkeypatch.delenv(ENV_KEEP_ALIVE, raising=False)
+        assert OllamaDecisionClient().request_body("s", "e")["keep_alive"] == KEEP_ALIVE
+
+    def test_it_outlasts_ollamas_default(self):
+        assert KEEP_ALIVE.endswith("m") and int(KEEP_ALIVE[:-1]) > 5
+
+    def test_the_environment_overrides_it(self, monkeypatch):
+        monkeypatch.setenv(ENV_KEEP_ALIVE, "-1")
+        assert OllamaDecisionClient().request_body("s", "e")["keep_alive"] == "-1"
+
+
 # --- Validation and retries ------------------------------------------------
 
 class TestValidationAndRetries:
@@ -205,6 +247,30 @@ class TestTransportErrors:
     def test_a_failed_reply_never_carries_a_decision(self):
         client, _ = client_with([urllib.error.URLError("x")])
         assert client.decide("sys", "e").decision is None
+
+    def test_a_slow_server_is_told_apart_from_a_dead_one(self):
+        """Two 120 s timeouts were measured on turns that take 9 s on an idle
+        machine, with the swap full. `ollama serve` is the wrong advice there.
+        A read timeout arrives bare; a connect timeout wrapped in a URLError."""
+        for exc in (TimeoutError("timed out"),
+                    urllib.error.URLError(TimeoutError("timed out"))):
+            client, transport = client_with([exc])
+            reply = client.decide("sys", "e")
+            assert not reply.usable
+            assert "did not answer within 120 s" in reply.error
+            assert "memory" in reply.error
+            assert "ollama serve" not in reply.error
+            assert len(transport.bodies) == 1, "the next attempt would take as long"
+
+    def test_the_chat_call_reports_transport_errors_the_same_way(self):
+        client, _ = client_with([TimeoutError("timed out")])
+        payload, error, _ = client.structured("s", "u", {"type": "object"})
+        assert payload is None and "did not answer within" in error
+
+    def test_a_missing_model_says_to_pull_it(self):
+        err = urllib.error.HTTPError("u", 404, "model not found", {}, None)
+        client, _ = client_with([err])
+        assert "ollama pull" in client.decide("sys", "e").error
 
 
 # --- Control flow must not read the prose ----------------------------------
@@ -308,3 +374,26 @@ class TestLiveOllama:
             pytest.skip(f"local model unavailable: {reply.error[:120]}")
         assert reply.latency_s < 30, (
             f"{reply.latency_s:.1f}s -- check that think=false is still being sent")
+
+
+def test_a_reply_cut_off_at_the_length_limit_says_so():
+    """A prompt that filled the context left the reply 95 tokens; the JSON never
+    closed and the user saw "not valid JSON" three times. It is reported once,
+    as what it is, since retrying the same request cannot help."""
+    from mypibypy.agent.client import NUM_CTX
+
+    cut = {"message": {"content": '{"intent": "change", "note": "I cannot'},
+           "done_reason": "length", "prompt_eval_count": 4001, "eval_count": 95}
+    client, transport = client_with([cut, cut, cut])
+    payload, error, _ = client.structured("system", "user", {"type": "object"})
+    assert payload is None
+    assert "cut off at the model's length limit" in error and "4001" in error
+    assert str(NUM_CTX) in error
+    assert len(transport.bodies) == 1
+
+
+def test_the_context_window_holds_a_long_chat_turn():
+    """4096 overflowed on a real chat turn (a 4001-token prompt)."""
+    from mypibypy.agent.client import NUM_CTX, NUM_PREDICT
+
+    assert NUM_CTX - NUM_PREDICT >= 4001 + 2000

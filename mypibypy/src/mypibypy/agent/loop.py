@@ -2,10 +2,11 @@
 
 The model is not in charge here, and that is deliberate. The deterministic
 classifier decides first; the model is consulted only when several signals
-genuinely conflict and there is no rule that settles it. Three situations:
+genuinely conflict and there is no rule that settles it. Four situations:
 
     CLEAR_PASS        something passed everything. Proceed. No model call.
     CLEAR_FAIL        nothing passed and no relaxation is left. Fail. No call.
+    UNSCREENED        a pair has no specificity screen. Stop for a human. No call.
     NEEDS_JUDGEMENT   a real tradeoff. Ask the model which constraint gives.
 
 That split is the point. A probe design where the geometry already answers the
@@ -20,6 +21,13 @@ how far constraints may be loosened before the run reports failure rather than
 loosening further, and `max_model_calls` caps spend. Without the relaxation cap
 the loop would loosen until something passed, and would therefore always
 "succeed" -- which is the specific failure this design is built against.
+
+A caller whose design function reads only some parameters -- the Streamlit
+Form's pipeline call takes a pair count, a spacing and a channel -- passes
+`allowed_actions`. A model choice outside that set would design the identical
+thing again and ask the same question until the turn budget failed a perfectly
+good design, so the loop stops for a human instead, recording both the model's
+choice and the code's.
 """
 from __future__ import annotations
 
@@ -45,6 +53,7 @@ from .tools import ScreenEvidence, WindowStats, screen_evidence, window_stats
 class Situation(str, Enum):
     CLEAR_PASS = "clear_pass"
     CLEAR_FAIL = "clear_fail"
+    UNSCREENED = "unscreened"          # a missing input, settled without a model
     NEEDS_JUDGEMENT = "needs_judgement"
 
 
@@ -136,6 +145,20 @@ def classify(ev: Evaluation, relaxations_left: int) -> tuple[Situation, str]:
                 f"no window satisfies the constraints ({ev.windows}); which "
                 f"constraint should give is a tradeoff with no fixed answer")
 
+    if ev.unscreened:
+        # Never silently proceed on an unscreened design: that is the mistake
+        # the order workbook already guards against, and it must not come back
+        # in through the agent. Nor is it a judgement call -- a missing screen
+        # is a missing input, and the only defensible answer a model could give
+        # is to stop for a human, so the code stops for one without the call.
+        # Ahead of a failing screen on purpose: mixed evidence (one pair
+        # failing, another never screened) is a human's to look at, not a
+        # tradeoff the model may resolve with `proceed`.
+        return (Situation.UNSCREENED,
+                "at least one pair was not screened, so nothing here "
+                "establishes specificity; stopped for a human without "
+                "consulting the model")
+
     if ev.any_screen_fails:
         if relaxations_left <= 0:
             return (Situation.CLEAR_FAIL,
@@ -144,14 +167,6 @@ def classify(ev: Evaluation, relaxations_left: int) -> tuple[Situation, str]:
         return (Situation.NEEDS_JUDGEMENT,
                 "a selected pair has a signal-capable off-target site; whether "
                 "to move the window or reduce the pair count is a judgement")
-
-    if ev.unscreened:
-        # Never silently proceed on an unscreened design: that is the mistake
-        # the order workbook already guards against, and it must not come back
-        # in through the agent.
-        return (Situation.NEEDS_JUDGEMENT,
-                "at least one pair was not screened, so nothing here "
-                "establishes specificity")
 
     if ev.paralog_arms:
         return (Situation.NEEDS_JUDGEMENT,
@@ -264,12 +279,23 @@ class DesignAgent:
     def __init__(self, design_fn, client: DecisionClient | None = None,
                  budget: Budget | None = None,
                  known_systems: tuple[str, ...] = (),
-                 store: rec.RunStore | None = None):
+                 store: rec.RunStore | None = None,
+                 allowed_actions=None):
         self.design_fn = design_fn
         self.client = client
         self.budget = budget or Budget()
         self.known_systems = tuple(known_systems)
         self.store = store
+        #: The actions `design_fn` can act on. Terminal actions are always in;
+        #: a model choice outside the set stops the run for a human rather
+        #: than designing the identical thing again. None means every action.
+        self.allowed_actions = (frozenset(Action) if allowed_actions is None
+                                else frozenset(allowed_actions) | TERMINAL_ACTIONS)
+
+    @property
+    def relaxations_offered(self) -> list[str]:
+        """The non-terminal actions this run may apply, by name."""
+        return sorted(a.value for a in self.allowed_actions - TERMINAL_ACTIONS)
 
     # -- the loop ----------------------------------------------------------
     def run(self, params: DesignParameters, target_label: str = "",
@@ -324,8 +350,39 @@ class DesignAgent:
                 fire_logged(machine, record, Event.CLEAR_FAIL)
                 return self._finish(record, "failed", params, ev, design, why)
 
+            if situation is Situation.UNSCREENED:
+                # Deterministic, and deliberately so: a missing screen is a
+                # missing input. Asking a model costs seconds and its only
+                # defensible answer is to stop for a human -- so stop for one.
+                record.log(rec.DETERMINISTIC_DECISION, turn,
+                           f"flag_for_review -- {why}",
+                           action=Action.FLAG_FOR_REVIEW.value)
+                fire_logged(machine, record, Event.UNSCREENED)
+                return self._finish(record, "flagged", params, ev, design, why)
+
             fire_logged(machine, record, Event.NEEDS_JUDGEMENT)
             decision = self._ask(record, turn, ev, why)
+
+            if decision.action not in self.allowed_actions:
+                # The caller said its design function does not act on that
+                # parameter. Applying it would design the identical thing again
+                # and ask the same question until the turn budget failed a good
+                # design, so the run stops for a human -- recorded as the
+                # code's decision, with the model's choice beside it.
+                record.log(rec.DETERMINISTIC_DECISION, turn,
+                           f"flag_for_review -- the model chose "
+                           f"{decision.action.value}, which this design "
+                           f"function does not act on",
+                           action=Action.FLAG_FOR_REVIEW.value,
+                           model_chose=decision.action.value,
+                           model_reason=decision.reason)
+                fire_logged(machine, record, Event.FLAG)
+                offered = ", ".join(self.relaxations_offered) or "no relaxation"
+                return self._finish(
+                    record, "flagged", params, ev, design,
+                    f"the model chose {decision.action.value}, which would not "
+                    f"change this design (here only {offered} can); a human "
+                    f"should decide")
 
             if decision.action in TERMINAL_ACTIONS:
                 event, status = {
@@ -398,8 +455,13 @@ class DesignAgent:
             record.log(rec.BUDGET, turn, "token budget reached; flagging for review")
             return fallback
 
+        offered = ""
+        if self.allowed_actions != frozenset(Action):
+            offered = (f"Actions that can change this design: "
+                       f"{', '.join(self.relaxations_offered) or 'none'}; any "
+                       f"other non-terminal action would change nothing here.\n\n")
         evidence = (f"{ev.summary()}\n\nWhy this needs a decision: {why}\n\n"
-                    f"Choose one action.")
+                    f"{offered}Choose one action.")
         reply = self.client.decide(SYSTEM_PROMPT, evidence)
         record.model_calls += 1
         record.input_tokens += reply.input_tokens

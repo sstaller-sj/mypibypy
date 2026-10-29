@@ -12,6 +12,7 @@ because the unchecked nine look as validated as the first.
 from __future__ import annotations
 
 import random
+from itertools import combinations
 
 import pytest
 from openpyxl import load_workbook
@@ -21,8 +22,10 @@ from mypibypy.design import (
     FOOTPRINT,
     build_pair,
     build_tiled_pairs,
+    repack,
     scan,
     select_tiled,
+    tile,
     tiled_names,
 )
 from mypibypy.loci import Locus
@@ -297,3 +300,63 @@ class TestSinglePairIsUnchanged:
         assert (tiled[0].p1l, tiled[0].p1r) == (direct.p1l, direct.p1r)
         assert (tiled[0].p1l_name, tiled[0].p1r_name) == (direct.p1l_name,
                                                           direct.p1r_name)
+
+
+# --- re-packing when greedy falls short -------------------------------------
+
+
+def _fits(chosen, spacing):
+    offs = sorted(c.offset for c in chosen)
+    return all(b - a >= FOOTPRINT + spacing for a, b in zip(offs, offs[1:]))
+
+
+def _windows(seed, length=260):
+    rng = random.Random(seed)
+    seq = "".join(rng.choice("ACGT") for _ in range(length))
+    return scan(seq, GenomicInterval("hg38", "chr1", 1, length), top=length)
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("n_pairs,spacing", [(2, 10), (3, 20), (4, 5), (5, 0)])
+def test_repack_matches_brute_force(seed, n_pairs, spacing):
+    """The most pairs that fit, and the least total penalty among those."""
+    windows = _windows(seed)[::7]           # a small set, so brute force is cheap
+    best_k, best_cost = 0, 0.0
+    for k in range(n_pairs, 0, -1):
+        costs = [sum(c.penalty for c in combo) for combo in combinations(windows, k)
+                 if _fits(combo, spacing)]
+        if costs:
+            best_k, best_cost = k, min(costs)
+            break
+    got = repack(windows, n_pairs, spacing)
+    assert len(got) == best_k and _fits(got, spacing)
+    assert sum(c.penalty for c in got) == pytest.approx(best_cost)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_greedy_is_kept_whenever_it_places_every_pair(seed):
+    windows = _windows(seed)
+    for n_pairs, spacing in [(1, 3), (2, 3), (3, 10)]:
+        greedy = select_tiled(windows, n_pairs, spacing)
+        if len(greedy) == n_pairs:
+            assert tile(windows, n_pairs, spacing) == (greedy, 0)
+
+
+def test_a_shortfall_is_re_packed_and_reported():
+    """A request greedy cannot meet but a different layout can."""
+    for seed in range(40):
+        windows = _windows(seed)
+        greedy = select_tiled(windows, 4, 15)
+        if len(greedy) < 4:
+            packed, from_greedy = tile(windows, 4, 15)
+            if len(packed) > len(greedy):
+                assert from_greedy == len(greedy) and _fits(packed, 15)
+                return
+    pytest.fail("no seed where greedy fell short and re-packing helped")
+
+
+def test_repack_honours_a_cost():
+    windows = _windows(1)[::5]
+    cost = lambda c: -c.offset                   # noqa: E731 -- prefer late windows
+    got = repack(windows, 2, 0, cost)
+    assert got[-1].offset == max(c.offset for c in windows)

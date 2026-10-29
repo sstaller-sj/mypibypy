@@ -45,6 +45,7 @@ from mypibypy.agent import (
 )
 from mypibypy.agent import record as rec
 from mypibypy.agent import tools as agent_tools
+from mypibypy.agent.actions import TERMINAL_ACTIONS
 from mypibypy.agent.loop import Evaluation
 from mypibypy.agent.tools import ScreenEvidence, WindowStats, screen_evidence
 from mypibypy.design import build_pair, scan
@@ -325,12 +326,6 @@ class TestConflictsReachTheModel:
         assert situation is Situation.NEEDS_JUDGEMENT
         assert "tradeoff with no fixed answer" in why
 
-    def test_an_unscreened_pair_is_never_silently_accepted(self):
-        ev = evaluation(screens=[ScreenEvidence(verdict="not screened", screened=False)])
-        situation, why = classify(ev, 3)
-        assert situation is Situation.NEEDS_JUDGEMENT
-        assert "establishes specificity" in why
-
     def test_a_paralog_like_arm_is_a_judgement_call(self):
         """One arm on several loci, partner absent: geometry says harmless, the
         experiment may not agree."""
@@ -357,6 +352,116 @@ class TestConflictsReachTheModel:
         situation, why = classify(ev, 0)
         assert situation is Situation.CLEAR_FAIL
         assert "budget is spent" in why
+
+
+class TestUnscreenedStopsWithoutAModel:
+    """A missing screen is a missing input, not a conflict between signals. It
+    used to cost a model call (5-8 s on a laptop) whose only defensible answer
+    was flag_for_review -- and that is what the model returned, every time."""
+
+    def test_an_unscreened_pair_is_never_silently_accepted(self):
+        ev = evaluation(screens=[ScreenEvidence(verdict="not screened", screened=False)])
+        situation, why = classify(ev, 3)
+        assert situation is Situation.UNSCREENED
+        assert "establishes specificity" in why and "without consulting" in why
+
+    def test_unscreened_outranks_a_failing_screen(self):
+        """Mixed evidence -- one pair failing, another never screened -- is a
+        human's to look at, not a tradeoff the model may settle with proceed."""
+        ev = evaluation(screens=[ScreenEvidence(verdict="fail", screened=True),
+                                 ScreenEvidence(verdict="not screened", screened=False)])
+        assert classify(ev, 3)[0] is Situation.UNSCREENED
+
+    def test_a_full_run_on_an_unscreened_design_calls_no_model(
+            self, region, candidates, system):
+        client = ScriptedClient([proceed_payload()])
+
+        def design_fn(p):
+            return make_design(region, candidates, system, verdict="not screened"), candidates
+
+        result = DesignAgent(design_fn, client=client,
+                             known_systems=SYSTEM_KEYS).run(DesignParameters())
+        assert result.status == "flagged"
+        assert client.calls == [], "a missing input is not a question for the model"
+        assert result.record.consulted_model is False
+        decision = result.record.decisions[-1]
+        assert decision.kind == rec.DETERMINISTIC_DECISION
+        assert decision.detail["action"] == "flag_for_review"
+        steps = [e.detail["event"] for e in result.record.of_kind(rec.TRANSITION)]
+        assert steps[-1] == "unscreened"
+
+
+class TestActionsTheDesignFunctionCannotApply:
+    """`allowed_actions`. The Form's pipeline call takes a pair count, a spacing
+    and a channel, so a `relax_tm` the model picks would design the identical
+    thing again and ask the same question until the turn budget failed a good
+    design. The loop stops for a human instead, and says what it could have done."""
+
+    def test_a_disallowed_relaxation_flags_rather_than_looping(
+            self, region, candidates, system):
+        designed = []
+
+        def design_fn(p):
+            designed.append(p)
+            return make_design(region, candidates, system, verdict="fail"), candidates
+
+        client = ScriptedClient([relax_payload("relax_tm"), relax_payload("relax_tm")])
+        result = DesignAgent(design_fn, client=client, known_systems=SYSTEM_KEYS,
+                             allowed_actions={Action.REDUCE_PAIRS}).run(
+                                 DesignParameters(n_pairs=2))
+        assert result.status == "flagged"
+        assert "relax_tm" in result.message and "reduce_pairs" in result.message
+        assert "human" in result.message
+        assert len(designed) == 1, "nothing was designed again"
+        assert len(client.calls) == 1, "nor was the model asked again"
+        last = result.record.decisions[-1]
+        assert last.kind == rec.DETERMINISTIC_DECISION
+        assert last.detail["model_chose"] == "relax_tm"
+
+    def test_the_model_is_told_which_actions_can_change_the_design(
+            self, region, candidates, system):
+        client = ScriptedClient([proceed_payload()])
+
+        def design_fn(p):
+            return make_design(region, candidates, system, verdict="fail"), candidates
+
+        DesignAgent(design_fn, client=client, known_systems=SYSTEM_KEYS,
+                    allowed_actions={Action.REDUCE_PAIRS}).run(DesignParameters())
+        _, evidence = client.calls[0]
+        assert "can change this design: reduce_pairs" in evidence
+
+    def test_terminal_actions_are_always_allowed(self, region, candidates, system):
+        client = ScriptedClient([proceed_payload()])
+
+        def design_fn(p):
+            return make_design(region, candidates, system, verdict="fail"), candidates
+
+        result = DesignAgent(design_fn, client=client, known_systems=SYSTEM_KEYS,
+                             allowed_actions=()).run(DesignParameters())
+        assert result.status == "succeeded"
+
+    def test_an_allowed_action_is_applied_and_designed_again(
+            self, region, candidates, system):
+        seen = []
+
+        def design_fn(p):
+            seen.append(p.n_pairs)
+            verdict = "fail" if p.n_pairs > 1 else "pass"
+            return (make_design(region, candidates, system, verdict=verdict,
+                                n_pairs=p.n_pairs), candidates)
+
+        client = ScriptedClient([relax_payload("reduce_pairs")])
+        result = DesignAgent(design_fn, client=client, known_systems=SYSTEM_KEYS,
+                             allowed_actions={Action.REDUCE_PAIRS}).run(
+                                 DesignParameters(n_pairs=2))
+        assert result.status == "succeeded"
+        assert seen == [2, 1]
+
+    def test_by_default_every_action_is_allowed(self, region, candidates, system):
+        agent = DesignAgent(lambda p: (None, []), client=None)
+        assert agent.allowed_actions == frozenset(Action)
+        assert agent.relaxations_offered == sorted(
+            a.value for a in Action if a not in TERMINAL_ACTIONS)
 
 
 # --- Budgets ---------------------------------------------------------------
@@ -399,7 +504,7 @@ class TestBudgetsAreHard:
     def test_the_model_call_budget_falls_back_to_review(self, region, candidates,
                                                         system):
         def design_fn(p):
-            return make_design(region, candidates, system, verdict="not screened"), candidates
+            return make_design(region, candidates, system, verdict="fail"), candidates
 
         client = ScriptedClient([relax_payload() for _ in range(10)])
         result = DesignAgent(design_fn, client=client, known_systems=SYSTEM_KEYS,
@@ -416,10 +521,13 @@ class TestBudgetsAreHard:
 # --- Degradation -----------------------------------------------------------
 
 class TestDegradesSafely:
+    """Each of these needs a genuine judgement case to reach the model, so the
+    design carries a failing screen; an unscreened one is settled before that."""
+
     def test_no_client_flags_for_review_rather_than_guessing(self, region,
                                                              candidates, system):
         def design_fn(p):
-            return make_design(region, candidates, system, verdict="not screened"), candidates
+            return make_design(region, candidates, system, verdict="fail"), candidates
 
         result = DesignAgent(design_fn, client=None,
                              known_systems=SYSTEM_KEYS).run(DesignParameters())
@@ -429,7 +537,7 @@ class TestDegradesSafely:
     def test_a_refusal_is_a_branch_not_a_crash(self, region, candidates, system):
         """Routine probe design can trip a biology classifier. The run degrades."""
         def design_fn(p):
-            return make_design(region, candidates, system, verdict="not screened"), candidates
+            return make_design(region, candidates, system, verdict="fail"), candidates
 
         result = DesignAgent(design_fn, client=ScriptedClient(refuse=True),
                              known_systems=SYSTEM_KEYS).run(DesignParameters())
@@ -441,7 +549,7 @@ class TestDegradesSafely:
     def test_an_api_error_flags_rather_than_proceeding(self, region, candidates,
                                                        system):
         def design_fn(p):
-            return make_design(region, candidates, system, verdict="not screened"), candidates
+            return make_design(region, candidates, system, verdict="fail"), candidates
 
         result = DesignAgent(design_fn, client=ScriptedClient(error="boom"),
                              known_systems=SYSTEM_KEYS).run(DesignParameters())
@@ -455,7 +563,7 @@ class TestRunRecord:
     def test_every_decision_is_recorded_with_its_evidence(self, region, candidates,
                                                           system):
         def design_fn(p):
-            return make_design(region, candidates, system, verdict="not screened"), candidates
+            return make_design(region, candidates, system, verdict="fail"), candidates
 
         result = DesignAgent(design_fn, client=ScriptedClient([proceed_payload()]),
                              known_systems=SYSTEM_KEYS).run(

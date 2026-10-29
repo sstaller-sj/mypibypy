@@ -36,7 +36,7 @@ from mypibypy.systems import systems
 
 EXAMPLE_LOCI = Path(mcp_server.__file__).with_name("loci.example.json")
 EXPECTED_TOOLS = {"status", "list_targets", "design_target", "decide_design",
-                  "write_order"}
+                  "write_order", "diagnose_design", "try_change"}
 
 
 @pytest.fixture(scope="module")
@@ -92,16 +92,41 @@ def session():
 
 
 def accepted(session, target_id, **kw):
-    """Design a target and resolve the decision point it stops at, if any.
+    """Design a target and, if it stopped for a human, accept it explicitly.
 
     With no screen backend every pair is NOT SCREENED, which the machine will
-    not wave through on its own: it waits in `decide` for an explicit call.
+    not wave through on its own: the design lands in `flagged`, without a
+    model call, and waits for an explicit `proceed` that is recorded against
+    the order.
     """
     out = session.design_target(target_id, **kw)
-    if out["state"] == "decide":
+    if out["state"] in ("decide", "flagged"):
         out = session.decide_design(out["design_id"], "proceed",
                                     "accepted unscreened for this test")
     return out
+
+
+@pytest.fixture
+def stubbed(monkeypatch, env):
+    """A screen that ran, without an aligner: `Session._run` returns a design
+    whose every pair carries the chosen verdict, at the requested pair count.
+    `fail` is the way to a genuine `decide` state offline."""
+    from test_agent import make_design
+    from mypibypy.design import scan
+    from mypibypy.sequence import GenomicInterval
+    rng = random.Random(4242)
+    seq = "".join(rng.choice("ACGT") for _ in range(400))
+    iv = GenomicInterval("mm10", "chr1", 1_000_000, 1_000_399)
+    cands = scan(seq, iv, top=len(seq))
+    sysobj = list(systems().values())[0]
+
+    def make(verdict):
+        monkeypatch.setattr(
+            Session, "_run",
+            lambda self, target, params, screen, pads: [
+                make_design((seq, iv), cands, sysobj, verdict=verdict,
+                            n_pairs=params.n_pairs)])
+    return make
 
 
 def live_tools():
@@ -280,17 +305,21 @@ class TestRecordsAndWorkbook:
 class TestTheMachineGatesTheTools:
     """The order a client may call things in is the state machine's, not its own."""
 
-    def test_an_unscreened_design_waits_for_a_decision(self, env, offline, session):
+    def test_an_unscreened_design_stops_for_a_human_without_a_decision(
+            self, env, offline, session):
         out = session.design_target("locus:GENE:enh")
-        assert out["state"] == "decide"
+        assert out["state"] == "flagged"
         assert "not screened" in out["why"].lower()
-        assert "decide_design" in out["next"]
+        assert "decide_design" in out["next"] and "proceed" in out["next"]
         assert out["relaxations_left"] == mcp_server.MAX_RELAXATIONS
+        record = RunStore().get(out["run_id"])
+        assert not record.of_kind("model_decision"), "nobody was asked"
+        assert record.of_kind("transition")[-1].detail["event"] == "unscreened"
 
-    def test_write_order_refuses_a_design_that_is_still_deciding(self, env, offline,
-                                                                 session):
+    def test_write_order_refuses_a_design_that_stopped_for_a_human(
+            self, env, offline, session):
         d = session.design_target("locus:GENE:enh")["design_id"]
-        with pytest.raises(ValueError, match="have not succeeded.*'decide'"):
+        with pytest.raises(ValueError, match="have not succeeded.*'flagged'"):
             session.write_order([d])
         assert not (env / "designs").exists()
 
@@ -301,12 +330,22 @@ class TestTheMachineGatesTheTools:
         assert any("accepted by the MCP client" in w for w in out["warnings"])
         session.write_order([out["design_id"]])
 
+    def test_from_flagged_the_only_decision_is_proceed(self, env, offline, session):
+        """A flagged design is accepted or left; a revision is a new run."""
+        d = session.design_target("locus:GENE:enh", n_pairs=3)["design_id"]
+        for action in ("reduce_pairs", "switch_system", "fail", "flag_for_review"):
+            with pytest.raises(ValueError, match="only decision is 'proceed'"):
+                session.decide_design(d, action, "try something else")
+        assert session.designs[d].state.value == "flagged"
+        assert session.designs[d].machine.relaxations == 0
+
     def test_decide_is_refused_outside_the_decide_state(self, env, offline, session):
         out = accepted(session, "locus:GENE:enh")
         with pytest.raises(ValueError, match="only applies while a design is in 'decide'"):
             session.decide_design(out["design_id"], "fail", "changed my mind")
 
-    def test_flagged_and_failed_designs_cannot_be_ordered(self, env, offline, session):
+    def test_flagged_and_failed_designs_cannot_be_ordered(self, env, stubbed, session):
+        stubbed("fail")
         for action in ("flag_for_review", "fail"):
             d = session.design_target("locus:GENE:enh")["design_id"]
             out = session.decide_design(d, action, "not happy with it")
@@ -314,7 +353,8 @@ class TestTheMachineGatesTheTools:
             with pytest.raises(ValueError, match="have not succeeded"):
                 session.write_order([d])
 
-    def test_a_decision_is_held_to_the_closed_schema(self, env, offline, session):
+    def test_a_decision_is_held_to_the_closed_schema(self, env, stubbed, session):
+        stubbed("fail")
         d = session.design_target("locus:GENE:enh", n_pairs=3)["design_id"]
         from mypibypy.agent import ParameterRefused
         with pytest.raises(ParameterRefused, match="oligo-length"):
@@ -323,32 +363,37 @@ class TestTheMachineGatesTheTools:
             session.decide_design(d, "relax_tm", "loosen it")
         assert session.designs[d].state.value == "decide", "refusals must not move the run"
 
-    def test_reduce_pairs_redesigns_and_charges_the_budget(self, env, offline, session):
+    def test_reduce_pairs_redesigns_and_charges_the_budget(self, env, stubbed, session):
+        stubbed("fail")
         d = session.design_target("locus:GENE:enh", n_pairs=3)["design_id"]
         out = session.decide_design(d, "reduce_pairs", "fewer pairs, fewer misses")
         assert out["results"][0]["n_pairs"] == 2
         assert out["relaxations_left"] == mcp_server.MAX_RELAXATIONS - 1
-        assert out["state"] == "decide"      # still unscreened
+        assert out["state"] == "decide"      # still failing its screen
 
     def test_the_relaxation_budget_ends_the_run_rather_than_loosening(
-            self, env, offline, session):
+            self, env, stubbed, session):
+        stubbed("fail")
         d = session.design_target("locus:GENE:enh", n_pairs=9)["design_id"]
         for _ in range(mcp_server.MAX_RELAXATIONS):
-            session.decide_design(d, "reduce_pairs", "again")
-        out = session.decide_design(d, "reduce_pairs", "once more")
+            out = session.decide_design(d, "reduce_pairs", "again")
         assert out["state"] == "failed"
-        assert "budget" in out["why"]
+        assert "budget is spent" in out["why"]
+        with pytest.raises(ValueError, match="only applies while"):
+            session.decide_design(d, "reduce_pairs", "once more")
         with pytest.raises(ValueError, match="have not succeeded"):
             session.write_order([d])
 
-    def test_a_no_op_action_is_not_charged(self, env, offline, session):
+    def test_a_no_op_action_is_not_charged(self, env, stubbed, session):
+        stubbed("fail")
         d = session.design_target("locus:GENE:enh")["design_id"]     # one pair
         with pytest.raises(ValueError, match="Nothing was charged"):
             session.decide_design(d, "reduce_pairs", "already minimal")
         assert session.designs[d].machine.relaxations == 0
 
-    def test_a_fusion_cannot_be_revised(self, env, session):
+    def test_a_fusion_cannot_be_revised(self, env, stubbed, session):
         from mypibypy.agent import ParameterRefused
+        stubbed("fail")
         d = session.design_target("fusion:demo_junction")["design_id"]
         with pytest.raises(ParameterRefused, match="fusion takes exactly one pair"):
             session.decide_design(d, "switch_system", "try the other channel")
@@ -358,37 +403,22 @@ class TestTheMachineGatesTheTools:
         out = accepted(session, "locus:GENE:enh")
         record = RunStore().get(out["run_id"])
         state = State.INTAKE
+        events = []
         for e in record.of_kind("transition"):
             assert State(e.detail["from"]) is state
             state = TRANSITIONS[(state, Event(e.detail["event"]))]
+            events.append(e.detail["event"])
         assert state in TERMINAL
+        assert events[-2:] == ["unscreened", "override"]
         assert record.of_kind("model_decision"), "the client's decision is recorded"
 
     def test_status_reports_each_design_state(self, env, offline, session):
         d = session.design_target("locus:GENE:enh")["design_id"]
-        assert session.status()["design_states"] == {d: "decide"}
+        assert session.status()["design_states"] == {d: "flagged"}
 
 
 class TestScreenedDesigns:
     """With a screen that ran, a clean design needs no decision at all."""
-
-    @pytest.fixture
-    def stubbed(self, monkeypatch, env):
-        from test_agent import candidates, make_design, region, system  # noqa: F401
-        rng = random.Random(4242)
-        seq = "".join(rng.choice("ACGT") for _ in range(400))
-        from mypibypy.design import scan
-        from mypibypy.sequence import GenomicInterval
-        iv = GenomicInterval("mm10", "chr1", 1_000_000, 1_000_399)
-        cands = scan(seq, iv, top=len(seq))
-        sysobj = list(systems().values())[0]
-
-        def make(verdict):
-            monkeypatch.setattr(
-                Session, "_run",
-                lambda self, target, params, screen, pads: [
-                    make_design((seq, iv), cands, sysobj, verdict=verdict)])
-        return make
 
     def test_a_clean_screen_succeeds_without_a_decision(self, stubbed, session):
         stubbed("pass")
@@ -405,6 +435,58 @@ class TestScreenedDesigns:
             session.write_order([out["design_id"]])
 
 
+class TestRefusalsReachTheClient:
+    """The SDK hides any exception but `ToolError` behind `Error executing tool`.
+
+    Every refusal above is asserted in-process with `pytest.raises`, which says
+    nothing about what a client sees. Over the wire, each one must arrive as an
+    error result that still carries the hint ("call list_targets", "only applies
+    while a design is in 'decide'"), or the model cannot correct itself.
+    """
+
+    def server(self, session):
+        pytest.importorskip("mcp")
+        return mcp_server.build_server(session)
+
+    def call(self, server, name, **arguments) -> str:
+        """The error text the SDK would send, or "" if the call succeeded."""
+        from mcp.server.mcpserver.exceptions import ToolError
+        try:
+            asyncio.run(server.call_tool(name, arguments))
+        except ToolError as exc:
+            return str(exc)
+        return ""
+
+    def test_an_unknown_design_id_says_so(self, env, session):
+        text = self.call(self.server(session), "write_order", design_ids=["d_nope"])
+        assert "unknown design id" in text and "server restart" in text
+
+    def test_an_unknown_target_points_at_the_real_ids(self, env, session):
+        text = self.call(self.server(session), "design_target", target_id="chr1:1-2")
+        assert "list_targets" in text and "locus:GENE:enh" in text
+
+    def test_a_state_refusal_names_the_state_and_the_way_out(self, env, offline,
+                                                              session):
+        server = self.server(session)
+        d = session.design_target("locus:GENE:enh")["design_id"]
+        text = self.call(server, "write_order", design_ids=[d])
+        assert "have not succeeded" in text and "'flagged'" in text
+        assert "decide_design" in text and "proceed" in text
+
+    def test_a_refused_parameter_is_explained(self, env, session):
+        text = self.call(self.server(session), "design_target",
+                         target_id="locus:GENE:enh", system="fitc_not_configured")
+        assert "unknown system" in text
+
+    def test_a_genuine_bug_still_crashes_generically(self, env, session, monkeypatch):
+        from mcp.server.mcpserver.exceptions import UnexpectedToolError
+        server = self.server(session)
+        monkeypatch.setattr(Session, "status", lambda self: 1 / 0)
+        with pytest.raises(UnexpectedToolError) as info:
+            asyncio.run(server.call_tool("status", {}))
+        assert "division" not in str(info.value), "a crash's text stays on the server"
+
+
 class TestEnvironment:
     def test_configure_never_overrides_what_is_set(self, monkeypatch, tmp_path):
         for var in ("MYPIBYPY_SYSTEMS", "MYPIBYPY_LOCI", "MYPIBYPY_AGENT_RUNS",
@@ -417,6 +499,72 @@ class TestEnvironment:
         assert "MYPIBYPY_SYSTEMS" not in os.environ      # no file there to point at
         assert os.environ["MYPIBYPY_AGENT_RUNS"] == "/keep/me.jsonl"
         assert os.environ[mcp_server.ENV_OUT_DIR] == str(tmp_path / "designs")
+
+
+class TestTroubleshooting:
+    """`diagnose_design` and `try_change`: the shared diagnosis layer over MCP.
+    Read-only -- neither may move a run or spend its budget."""
+
+    def short(self, session):
+        """Nine pairs at 40 nt spacing cannot fit the 600 nt test locus."""
+        out = session.design_target("locus:GENE:enh", n_pairs=9, min_spacing=40)
+        assert out["results"][0]["n_pairs"] < 9
+        return out["design_id"]
+
+    def test_facts_say_why_pairs_are_missing(self, env, offline, session):
+        d = self.short(session)
+        out = session.diagnose_design(d)
+        placement = [f["text"] for f in out["facts"] if f["topic"] == "placement"]
+        assert placement and "of 9 requested" in placement[0]
+        screen = next(f["text"] for f in out["facts"] if f["topic"] == "screen")
+        assert "NOT screened" in screen
+
+    def test_a_short_design_comes_with_previews(self, env, offline, session):
+        out = session.diagnose_design(self.short(session))
+        spacings = [w["min_spacing"] for w in out["what_if"] if w["change"] == "min_spacing"]
+        assert spacings and all(s < 40 for s in spacings)
+        assert "design_target" in out["what_if_note"]
+
+    def test_a_full_design_has_nothing_to_preview(self, env, offline, session):
+        out = session.diagnose_design(session.design_target("locus:GENE:enh")["design_id"])
+        assert "what_if" not in out
+
+    def test_a_preview_matches_designing_with_it(self, env, offline, session):
+        d = self.short(session)
+        preview = session.try_change(d, min_spacing=5)["what_if"]
+        designed = session.design_target("locus:GENE:enh", n_pairs=9, min_spacing=5)
+        assert preview["pairs_placed"] == designed["results"][0]["n_pairs"]
+
+    def test_neither_tool_moves_the_run(self, env, offline, session):
+        d = self.short(session)
+        stored = session.designs[d]
+        before = (stored.state, stored.machine.turn, stored.machine.relaxations,
+                  len(stored.record.events), stored.params)
+        session.diagnose_design(d)
+        session.try_change(d, n_pairs=3, min_spacing=0)
+        assert before == (stored.state, stored.machine.turn, stored.machine.relaxations,
+                          len(stored.record.events), stored.params)
+
+    def test_a_preview_is_clamped_like_a_design(self, env, offline, session):
+        out = session.try_change(self.short(session), n_pairs=500)
+        assert out["what_if"]["n_pairs"] == 50
+        assert any("n_pairs" in w for w in out["warnings"])
+
+    def test_a_preview_needs_something_to_change(self, env, offline, session):
+        with pytest.raises(ValueError, match="n_pairs, min_spacing"):
+            session.try_change(self.short(session))
+
+    def test_a_fusion_cannot_be_previewed(self, env, session):
+        d = session.design_target("fusion:demo_junction")["design_id"]
+        assert "what_if" not in session.diagnose_design(d)
+        with pytest.raises(ValueError, match="cannot be previewed"):
+            session.try_change(d, min_spacing=0)
+
+    def test_nothing_sequence_shaped_comes_out(self, env, offline, session):
+        d = self.short(session)
+        text = json.dumps([session.diagnose_design(d),
+                           session.try_change(d, n_pairs=4, min_spacing=10)])
+        assert not DNA_RUN.findall(text)
 
 
 def test_the_server_answers_over_stdio(env):
@@ -435,10 +583,17 @@ def test_the_server_answers_over_stdio(env):
                 await client.initialize()
                 tools = {t.name for t in (await client.list_tools()).tools}
                 result = await client.call_tool("list_targets", {})
-                return tools, result
+                refused = await client.call_tool("write_order",
+                                                 {"design_ids": ["d_nothing"]})
+                return tools, result, refused
 
-    tools, result = asyncio.run(asyncio.wait_for(talk(), timeout=60))
+    tools, result, refused = asyncio.run(asyncio.wait_for(talk(), timeout=60))
     assert tools == EXPECTED_TOOLS
     text = "".join(getattr(c, "text", "") for c in result.content)
     assert "fusion:demo_junction" in text
     assert not DNA_RUN.findall(text)
+    # A refusal is an error result that still says why, not the SDK's generic
+    # "Error executing tool write_order" with the reason left in the server log.
+    assert refused.is_error
+    why = "".join(getattr(c, "text", "") for c in refused.content)
+    assert "unknown design id" in why and "server restart" in why

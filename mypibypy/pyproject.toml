@@ -35,7 +35,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # Placeholder systems and example loci ship so a fresh clone runs end to end.
-mypibypy = ["systems.example.json", "loci.example.json"]
+mypibypy = ["systems.example.json", "loci.example.json", "indexes.example.json"]
 
 [tool.pytest.ini_options]
 # Makes `pytest` work from this directory with no PYTHONPATH, which is also what

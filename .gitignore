@@ -35,6 +35,9 @@ systems.local.json
 # Experiment-specific target loci (see src/mypibypy/loci.py)
 loci.local.json
 
+# Machine-specific specificity index paths (see src/mypibypy/indexes.py)
+indexes.local.json
+
 # Design data: order workbooks contain probe sequences and target/fusion designs
 *.xlsx
 designs/
@@ -57,3 +60,4 @@ pifish-agent/
 
 # Output of the removed NCBI web BLAST step (it never returned usable results)
 blast_*.txt
+.agents/

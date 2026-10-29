@@ -561,6 +561,83 @@ def select_tiled(candidates: list[Candidate], n_pairs: int,
     return sorted(chosen, key=lambda c: c.offset)
 
 
+def repack(candidates: list[Candidate], n_pairs: int, min_spacing: int,
+           cost=None) -> list[Candidate]:
+    """The most pairs, up to `n_pairs`, that fit -- and of those, the set with
+    the least total cost. Exact, by dynamic programming over position.
+
+    The answer to what `select_tiled` cannot do: once greedy has taken the
+    best-ranked windows it never moves them, so it can stop short of a count
+    that a different layout fits. (A 420 nt sequence asked for 4 pairs at
+    50 nt spacing needs 354 nt end to end, yet greedy placed 3: its first
+    three picks left gaps of 105 and 125 nt where a pair needs 151.)
+
+    `cost` scores a window, lower better; the default is its ranking penalty.
+    Returned in position order. O(windows x pairs).
+    """
+    from bisect import bisect_right
+
+    cost = cost or (lambda c: c.penalty)
+    ordered = sorted(candidates, key=lambda c: c.offset)
+    offsets = [c.offset for c in ordered]
+    costs = [cost(c) for c in ordered]
+    step = FOOTPRINT + min_spacing
+    # prev[i]: how many windows end in time to precede window i.
+    prev = [bisect_right(offsets, o - step) for o in offsets]
+    inf = float("inf")
+    width = len(ordered) + 1
+
+    # best[j][i]: least cost of j windows among the first i; took[j][i]: whether
+    # window i-1 is one of them. Ties keep the earlier layout, so it is stable.
+    best = [[0.0] * width]
+    took: list[bytearray] = [bytearray(width)]
+    for j in range(1, n_pairs + 1):
+        last, row, mark = best[j - 1], [inf] * width, bytearray(width)
+        for i in range(1, width):
+            use = last[prev[i - 1]] + costs[i - 1]
+            if use < row[i - 1]:
+                row[i], mark[i] = use, 1
+            else:
+                row[i] = row[i - 1]
+        if row[-1] == inf:
+            break
+        best.append(row)
+        took.append(mark)
+
+    chosen, i, j = [], len(ordered), len(best) - 1
+    while j:
+        if took[j][i]:
+            chosen.append(ordered[i - 1])
+            i, j = prev[i - 1], j - 1
+        else:
+            i -= 1
+    return chosen[::-1]
+
+
+def tile(candidates: list[Candidate], n_pairs: int,
+         min_spacing: int = DEFAULT_MIN_SPACING_NT,
+         cost=None) -> tuple[list[Candidate], int]:
+    """Pick the pairs to order: greedy, and re-packed only if greedy falls short.
+
+    Returns (pairs in position order, greedy's count if it was re-packed else 0).
+
+    Greedy stays the rule because it keeps the best windows -- the reason
+    `select_tiled` gives -- and every design it fills is exactly what it was.
+    When it stops short of `n_pairs`, the request is for more pairs than the
+    best windows leave room for, so the layout is solved instead (`repack`):
+    the most pairs that fit, best total cost among those. That uses
+    lower-ranked windows, which is the price of the count, and the caller
+    reports it.
+    """
+    greedy = select_tiled(candidates, n_pairs, min_spacing)
+    if len(greedy) >= n_pairs:
+        return greedy, 0
+    packed = repack(candidates, n_pairs, min_spacing, cost)
+    if len(packed) <= len(greedy):
+        return greedy, 0
+    return packed, len(greedy)
+
+
 def tiled_names(gene: str, name: str, index: int, n_total: int) -> tuple[str, str]:
     """(P1L name, P1R name) for pair `index` of `n_total`.
 

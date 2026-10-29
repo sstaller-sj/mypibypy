@@ -32,7 +32,7 @@ from .design import (
     fusion_footprint,
     scan,
     scan_transcript,
-    select_tiled,
+    tile,
     tiled_names,
 )
 from .fold import PairFolding, pair_folding
@@ -69,6 +69,20 @@ class DesignResult:
     #: Self-folding of each ordered pair's P1L/P1R, parallel to `pairs`. Empty
     #: for results built by hand; `folding_at` then says it was not evaluated.
     pair_folding: list[PairFolding] = field(default_factory=list)
+    #: The ranked windows an RNA design tiles from, in `design_rna`'s order:
+    #: its accessibility shortlist first, then every other window. Kept, with
+    #: the cost each was scored at, so a preview of another pair count or
+    #: spacing (`diagnosis`) tiles exactly as the pipeline would. Empty for a
+    #: genomic design, which tiles from every window of the region.
+    tiling_pool: list[Candidate] = field(default_factory=list, repr=False)
+    tiling_costs: dict[int, float] = field(default_factory=dict, repr=False)
+    #: How many pairs greedy placement fit, when that fell short and the pairs
+    #: were re-packed to fit more (`design.tile`); 0 when greedy filled it.
+    repacked_from: int = 0
+    #: Whether placement was solved, so a shortfall means no layout of the
+    #: candidate windows fits more -- not just that greedy stopped. False for
+    #: a single pair and for results built by hand.
+    packing_solved: bool = False
 
     def __post_init__(self) -> None:
         if not self.pairs:
@@ -123,6 +137,16 @@ def _folding(pairs: list[ProbePair], check: bool) -> list[PairFolding]:
     return [pair_folding(p) for p in pairs]
 
 
+def rank_locus_windows(seq: str, interval, rmsk: list[dict]) -> list[Candidate]:
+    """Every repeat-free 51 nt window of a genomic region, best-ranked first.
+
+    The ranking `design_locus` tiles from. Repeats are soft-masked so a pad is
+    never placed in repetitive DNA.
+    """
+    masked = mask_repeats(seq, interval, rmsk)
+    return scan(masked, interval, top=len(masked))
+
+
 def design_locus(locus: Locus, top: int = 5, backend: Backend | None = None,
                  screen: bool = True, n_pairs: int = 1,
                  min_spacing: int = DEFAULT_MIN_SPACING_NT,
@@ -145,18 +169,14 @@ def design_locus(locus: Locus, top: int = 5, backend: Backend | None = None,
     system = get_system(locus.system)
     seq = fetch_sequence(locus.interval)
     rmsk = rmsk_hits(locus.interval)
-    # Soft-mask repeats so probe pads are never placed in repetitive DNA.
-    masked = mask_repeats(seq, locus.interval, rmsk)
-    # Rank every window when tiling, so selection has somewhere to choose from;
-    # `candidates` is still trimmed to `top` for reporting, and its first entry
-    # is unchanged either way because the ranking is the same sort.
-    scan_top = top if n_pairs == 1 else max(top, len(masked))
-    ranked = scan(masked, locus.interval, top=scan_top)
+    # Every window is ranked, so tiling has somewhere to choose from;
+    # `candidates` is still trimmed to `top` for reporting.
+    ranked = rank_locus_windows(seq, locus.interval, rmsk)
     if not ranked:
         raise ValueError(f"no valid repeat-free 51-nt window found in {locus.name}")
     cands = ranked[:top]
 
-    selected = select_tiled(ranked, n_pairs, min_spacing)
+    selected, repacked_from = tile(ranked, n_pairs, min_spacing)
     pairs = build_tiled_pairs(locus.name, locus.gene, system, selected)
 
     screens = []
@@ -169,7 +189,8 @@ def design_locus(locus: Locus, top: int = 5, backend: Backend | None = None,
                 not_screened("genome screen skipped by request (screen=False)"))
     return DesignResult(locus, system, seq, cands, pairs[0], rmsk, screens[0],
                         pairs=pairs, pair_screens=screens,
-                        pair_folding=_folding(pairs, check_folding))
+                        pair_folding=_folding(pairs, check_folding),
+                        repacked_from=repacked_from, packing_solved=n_pairs > 1)
 
 
 class FusionIsSinglePair(ValueError):
@@ -285,6 +306,66 @@ def design_fusion(junction: FusionJunction, backend=None, screen: bool = True,
 RNA_SCREEN_POLICY = "transcriptome-only by default; see RNA_SCREEN_POLICY"
 
 
+@dataclass
+class RnaRanking:
+    """How `design_rna` ranks a transcript's windows, kept for tiling and previews."""
+
+    ranked: list[Candidate]               # shortlist first, then every other window
+    costs: dict[int, float]               # tiling cost by offset
+    access: dict[int, AccessibilityResult]
+    shortlist: list[Candidate]            # the windows accessibility re-ranked
+
+
+def rank_rna_windows(seq: str, target: RnaTarget, top: int = 5,
+                     accessibility_top: int = 25, check_accessibility: bool = True,
+                     accessibility_weight: float = DEFAULT_ACCESSIBILITY_WEIGHT,
+                     nucleation_nt: int = DEFAULT_NUCLEATION_NT) -> RnaRanking:
+    """Every window of a transcript, ranked as `design_rna` tiles from them."""
+    # Every window is scored; accessibility is evaluated for a shortlist of the
+    # best, wider than requested so it has candidates to choose between: the
+    # most accessible window is often not the best-scoring one on GC and Tm
+    # alone, and re-ranking a list of one achieves nothing.
+    every = scan_transcript(seq, target.accession, top=len(seq),
+                            scan_start=target.scan_start, scan_end=target.scan_end,
+                            exon_boundaries=target.exon_boundaries)
+    if not every:
+        raise ValueError(f"no valid 51-nt window found in {target.accession}")
+    cands = every[:max(top, accessibility_top)]
+
+    # Accessibility is RNA-only and is applied HERE, not in `design._score`.
+    # That keeps `_score` byte-comparable with every design made before this
+    # existed -- adding a term there would retroactively reorder genomic
+    # designs that have already been ordered. See accessibility.py on why any
+    # threshold is uncalibrated; this is a ranking input, never a reject.
+    access: dict[int, AccessibilityResult] = {}
+    if check_accessibility:
+        for cand in cands:
+            access[cand.offset] = site_accessibility(
+                seq, cand.offset, nucleation_nt=nucleation_nt)
+        cands = sorted(
+            cands,
+            key=lambda c: c.penalty + accessibility_penalty(
+                access[c.offset], weight=accessibility_weight),
+        )
+    # Tiled from every window, the shortlist first in its accessibility order
+    # and the rest after it on GC/Tm alone -- so greedy takes exactly what it
+    # took from the shortlist whenever the shortlist holds every pair, and only
+    # reaches past it when it does not. (Tiling from the shortlist alone placed
+    # 3 of 4 on a 420 nt sequence where 4 fit.) A window outside the shortlist
+    # has no accessibility yet; scored at the worst the shortlist saw, it
+    # cannot outrank an evaluated one by not having been evaluated.
+    shortlist = cands
+    ranked = shortlist + every[len(shortlist):]
+    costs = {c.offset: c.penalty + (accessibility_penalty(
+                 access[c.offset], weight=accessibility_weight)
+                 if c.offset in access else 0.0)
+             for c in shortlist}
+    unknown = max((costs[c.offset] - c.penalty for c in shortlist), default=0.0)
+    for c in every[len(shortlist):]:
+        costs[c.offset] = c.penalty + unknown
+    return RnaRanking(ranked, costs, access, shortlist)
+
+
 def design_rna(target: RnaTarget, backend=None, screen: bool = True,
                top: int = 5, transcript_seq: str | None = None,
                also_genome_backend=None, check_accessibility: bool = True,
@@ -322,33 +403,22 @@ def design_rna(target: RnaTarget, backend=None, screen: bool = True,
     system = get_system(target.system)
     seq = transcript_seq if transcript_seq is not None else fetch_transcript(
         target.accession)
-    # Scan wider than requested so accessibility has candidates to choose
-    # between: the most accessible window is often not the best-scoring one on
-    # GC and Tm alone, and re-ranking a list of one achieves nothing.
-    cands = scan_transcript(seq, target.accession, top=max(top, accessibility_top),
-                            scan_start=target.scan_start, scan_end=target.scan_end,
-                            exon_boundaries=target.exon_boundaries)
-    if not cands:
-        raise ValueError(f"no valid 51-nt window found in {target.accession}")
-
-    # Accessibility is RNA-only and is applied HERE, not in `design._score`.
-    # That keeps `_score` byte-comparable with every design made before this
-    # existed -- adding a term there would retroactively reorder genomic
-    # designs that have already been ordered. See accessibility.py on why any
-    # threshold is uncalibrated; this is a ranking input, never a reject.
-    access: dict[int, AccessibilityResult] = {}
+    ranking = rank_rna_windows(
+        seq, target, top=top, accessibility_top=accessibility_top,
+        check_accessibility=check_accessibility,
+        accessibility_weight=accessibility_weight, nucleation_nt=nucleation_nt)
+    ranked, costs, access = ranking.ranked, ranking.costs, ranking.access
+    shortlist = ranking.shortlist
+    cands = shortlist[:top]
+    selected, repacked_from = tile(ranked, n_pairs, min_spacing,
+                                   cost=lambda c: costs[c.offset])
+    # Evaluated now for any pair taken from past the shortlist, so every
+    # ordered pair still reports its accessibility.
     if check_accessibility:
-        for cand in cands:
-            access[cand.offset] = site_accessibility(
-                seq, cand.offset, nucleation_nt=nucleation_nt)
-        cands = sorted(
-            cands,
-            key=lambda c: c.penalty + accessibility_penalty(
-                access[c.offset], weight=accessibility_weight),
-        )
-    ranked = cands
-    cands = cands[:top]
-    selected = select_tiled(ranked, n_pairs, min_spacing)
+        for cand in selected:
+            if cand.offset not in access:
+                access[cand.offset] = site_accessibility(
+                    seq, cand.offset, nucleation_nt=nucleation_nt)
     pairs = build_tiled_pairs(target.name, target.gene, system, selected)
     locus = Locus(name=target.name, gene=target.gene,
                   description=(target.description
@@ -381,4 +451,6 @@ def design_rna(target: RnaTarget, backend=None, screen: bool = True,
                         specificity=screens[0], accessibility=accesses[0],
                         pairs=pairs, pair_screens=screens,
                         pair_accessibility=accesses,
-                        pair_folding=_folding(pairs, check_folding))
+                        pair_folding=_folding(pairs, check_folding),
+                        tiling_pool=ranked, tiling_costs=costs,
+                        repacked_from=repacked_from, packing_solved=n_pairs > 1)

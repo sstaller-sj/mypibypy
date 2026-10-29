@@ -257,3 +257,14 @@ class TestExpressionStatus:
         weighted, text = expression_status(result)
         assert not weighted
         assert "1 of 2 pair(s)" in text
+
+
+def test_the_no_change_reply_names_the_run_and_what_would_change_it():
+    """Shown instead of designing again when a chat request moves no setting."""
+    from mypibypy.ui import no_change_reply
+
+    text = no_change_reply("change", 3)
+    assert "run #3 stands" in text and "*change*" in text
+    for setting in ("channel", "pairs", "spacing", "screen", "GC/Tm"):
+        assert setting in text
+    assert "deterministic" in text
