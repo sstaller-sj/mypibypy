@@ -7,7 +7,10 @@ tests pin the three guarantees the module docstring states:
 * no tool takes a sequence, a target or a path -- checked on the LIVE schemas
   the SDK would advertise, not on a list kept by hand;
 * no tool result carries a base;
-* a screen that did not run says so, and placeholder inputs are announced.
+* a screen that did not run says so, and placeholder inputs are announced;
+* a design survives a server restart by its description alone -- the store
+  beside the run record carries no base, and a design rebuilt from it keeps
+  the state it was left in.
 
 Designs here are hermetic: genomic fetches are stubbed, and fusions carry their
 own sequence. Tests that need the `mcp` package skip without it.
@@ -23,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from mypibypy import mcp_server, pipeline
+from mypibypy import mcp_server, mcp_store, pipeline
 from mypibypy.agent.record import RunStore
 from mypibypy.mcp_server import (
     DNA_RUN,
@@ -70,6 +73,7 @@ def loci_file(tmp_path, keys):
 def env(monkeypatch, tmp_path, loci_file):
     monkeypatch.setenv("MYPIBYPY_LOCI", str(loci_file))
     monkeypatch.setenv("MYPIBYPY_AGENT_RUNS", str(tmp_path / "runs.jsonl"))
+    monkeypatch.setenv(mcp_store.ENV_VAR, str(tmp_path / mcp_store.LOCAL_FILENAME))
     monkeypatch.setenv(mcp_server.ENV_OUT_DIR, str(tmp_path / "designs"))
     return tmp_path
 
@@ -87,6 +91,13 @@ def offline(monkeypatch):
 @pytest.fixture
 def session():
     # No backends: every screen is an explicit NOT_SCREENED.
+    return Session(genome_reason="no index in tests",
+                   transcriptome_reason="no index in tests")
+
+
+def restarted() -> Session:
+    """A new `Session`, as a freshly launched server would make one: nothing in
+    memory, the same files on disk."""
     return Session(genome_reason="no index in tests",
                    transcriptome_reason="no index in tests")
 
@@ -296,8 +307,9 @@ class TestRecordsAndWorkbook:
         assert "no genome-wide specificity screen" in cells
 
     def test_unknown_design_ids_are_refused(self, env, session):
-        with pytest.raises(ValueError, match="unknown design id"):
+        with pytest.raises(ValueError, match="unknown design id") as info:
             session.write_order(["d_nope"])
+        assert "design store" in str(info.value)
         with pytest.raises(ValueError):
             session.write_order([])
 
@@ -459,7 +471,8 @@ class TestRefusalsReachTheClient:
 
     def test_an_unknown_design_id_says_so(self, env, session):
         text = self.call(self.server(session), "write_order", design_ids=["d_nope"])
-        assert "unknown design id" in text and "server restart" in text
+        assert "unknown design id" in text and "design store" in text
+        assert "survive a server restart" in text, "the hint says what is true now"
 
     def test_an_unknown_target_points_at_the_real_ids(self, env, session):
         text = self.call(self.server(session), "design_target", target_id="chr1:1-2")
@@ -490,8 +503,11 @@ class TestRefusalsReachTheClient:
 class TestEnvironment:
     def test_configure_never_overrides_what_is_set(self, monkeypatch, tmp_path):
         for var in ("MYPIBYPY_SYSTEMS", "MYPIBYPY_LOCI", "MYPIBYPY_AGENT_RUNS",
-                    mcp_server.ENV_OUT_DIR):
-            monkeypatch.delenv(var, raising=False)
+                    mcp_server.ENV_OUT_DIR, mcp_store.ENV_VAR):
+            # `configure_environment` writes os.environ itself; registering each
+            # variable with monkeypatch first makes teardown undo what it sets.
+            monkeypatch.setenv(var, "")
+            monkeypatch.delenv(var)
         (tmp_path / "loci.local.json").write_text("{}")
         monkeypatch.setenv("MYPIBYPY_AGENT_RUNS", "/keep/me.jsonl")
         configure_environment(tmp_path)
@@ -499,6 +515,243 @@ class TestEnvironment:
         assert "MYPIBYPY_SYSTEMS" not in os.environ      # no file there to point at
         assert os.environ["MYPIBYPY_AGENT_RUNS"] == "/keep/me.jsonl"
         assert os.environ[mcp_server.ENV_OUT_DIR] == str(tmp_path / "designs")
+        # The design store goes beside the run record, wherever that was sent.
+        assert os.environ[mcp_store.ENV_VAR] == "/keep/mcp_designs.local.jsonl"
+
+    def test_the_design_store_defaults_beside_the_run_record(self, monkeypatch, tmp_path):
+        monkeypatch.delenv(mcp_store.ENV_VAR, raising=False)
+        monkeypatch.setenv("MYPIBYPY_AGENT_RUNS", str(tmp_path / "runs" / "r.jsonl"))
+        assert mcp_store.resolve_store_path() == tmp_path / "runs" / "mcp_designs.local.jsonl"
+        monkeypatch.setenv(mcp_store.ENV_VAR, str(tmp_path / "elsewhere.jsonl"))
+        assert mcp_store.resolve_store_path() == tmp_path / "elsewhere.jsonl"
+
+
+class TestDesignsSurviveARestart:
+    """A design is saved by its description and rebuilt by running the pipeline
+    again. What must hold: the rebuilt design is the one that was recorded, it
+    keeps the state it was left in so the gates apply unchanged, its run record
+    stays a legal path, and the store carries no base."""
+
+    def store_text(self, env) -> str:
+        return (env / mcp_store.LOCAL_FILENAME).read_text()
+
+    def test_a_later_session_can_order_a_design_accepted_earlier(self, env, offline,
+                                                                  session):
+        d = accepted(session, "locus:GENE:enh", n_pairs=2)["design_id"]
+        later = restarted()
+        assert d not in later.designs
+        out = later.write_order([d])
+        assert Path(out["workbook"]).is_file() and out["designs"] == [d]
+        # The same design came back, not merely a design.
+        before = [(p.p1l, p.p1r) for r in session.designs[d].results for p in r.pairs]
+        after = [(p.p1l, p.p1r) for r in later.designs[d].results for p in r.pairs]
+        assert after == before
+        assert later.designs[d].state.value == "succeeded"
+        assert later.status()["design_states"] == {d: "succeeded"}
+
+    def test_a_reloaded_flagged_design_still_needs_proceed(self, env, offline, session):
+        d = session.design_target("locus:GENE:enh")["design_id"]
+        later = restarted()
+        with pytest.raises(ValueError, match="have not succeeded.*'flagged'"):
+            later.write_order([d])
+        assert not (env / "designs").exists()
+        for action in ("fail", "reduce_pairs"):
+            with pytest.raises(ValueError, match="only decision is 'proceed'"):
+                later.decide_design(d, action, "something else")
+        out = later.decide_design(d, "proceed", "reviewed in a later conversation")
+        assert out["state"] == "succeeded"
+        assert any("accepted by the MCP client" in w for w in out["warnings"])
+        later.write_order([d])
+        # And a third server sees the acceptance, not the flag.
+        assert restarted()._get(d).state.value == "succeeded"
+
+    def test_a_reloaded_decide_design_can_still_be_decided(self, env, stubbed, session):
+        stubbed("fail")
+        d = session.design_target("locus:GENE:enh", n_pairs=3)["design_id"]
+        assert session.designs[d].state.value == "decide"
+        later = restarted()
+        out = later.decide_design(d, "reduce_pairs", "fewer pairs, fewer misses")
+        assert out["results"][0]["n_pairs"] == 2
+        assert out["relaxations_left"] == mcp_server.MAX_RELAXATIONS - 1
+        assert out["state"] == "decide"
+        # The budget carried over too: a third server continues from one relaxation spent.
+        third = restarted()
+        assert third._get(d).machine.relaxations == 1
+        assert third._get(d).params.n_pairs == 2
+
+    def test_a_failed_design_stays_failed(self, env, stubbed, session):
+        stubbed("fail")
+        d = session.design_target("locus:GENE:enh")["design_id"]
+        session.decide_design(d, "fail", "not good enough")
+        later = restarted()
+        with pytest.raises(ValueError, match="have not succeeded.*'failed'"):
+            later.write_order([d])
+        with pytest.raises(ValueError, match="only applies while"):
+            later.decide_design(d, "proceed", "changed my mind")
+
+    def test_the_reloaded_run_record_is_still_a_legal_path(self, env, offline, session):
+        from mypibypy.agent.states import TRANSITIONS, TERMINAL, Event, State
+        first = session.design_target("locus:GENE:enh")
+        later = restarted()
+        out = later.decide_design(first["design_id"], "proceed", "reviewed later")
+        assert out["run_id"] == first["run_id"], "one run, continued"
+        record = RunStore().get(first["run_id"])
+        state = State.INTAKE
+        events = []
+        for e in record.of_kind("transition"):
+            assert State(e.detail["from"]) is state
+            state = TRANSITIONS[(state, Event(e.detail["event"]))]
+            events.append(e.detail["event"])
+        assert state in TERMINAL and record.status == "succeeded"
+        assert events[-2:] == ["unscreened", "override"]
+        reloads = [e for e in record.of_kind("tool_call") if "reloaded" in e.summary]
+        assert len(reloads) == 1 and "digest matched" in reloads[0].summary
+
+    def test_a_lost_run_record_is_continued_not_invented(self, env, offline, session):
+        d = session.design_target("locus:GENE:enh")
+        (env / "runs.jsonl").unlink()
+        later = restarted()
+        later.decide_design(d["design_id"], "proceed", "reviewed later")
+        record = RunStore().get(d["run_id"])
+        assert record is not None and record.status == "succeeded"
+        assert "continuation" in record.request and "not found" in record.request
+        assert record.parameters_history, "the parameters it was rebuilt with"
+        assert [e.detail["event"] for e in record.of_kind("transition")] == ["override"]
+
+    def test_every_state_change_is_saved_once(self, env, stubbed, session):
+        stubbed("fail")
+        store = mcp_store.DesignStore()
+        d = session.design_target("locus:GENE:enh", n_pairs=3)["design_id"]
+        assert store.get(d)["machine"] == {
+            "state": "decide", "turn": 1, "relaxations": 0,
+            "max_turns": mcp_server.MAX_TURNS,
+            "max_relaxations": mcp_server.MAX_RELAXATIONS}
+        session.decide_design(d, "reduce_pairs", "fewer")
+        assert store.get(d)["machine"]["relaxations"] == 1
+        assert store.get(d)["params"]["n_pairs"] == 2
+        with pytest.raises(ValueError):                 # a refusal moves nothing
+            session.decide_design(d, "relax_tm", "loosen")
+        lines = len(store.all())
+        session.decide_design(d, "flag_for_review", "for the lab")
+        assert store.get(d)["machine"]["state"] == "flagged"
+        assert len(store.all()) == lines + 1
+        session.diagnose_design(d)                       # read-only tools write nothing
+        assert len(store.all()) == lines + 1
+
+    def test_the_store_carries_no_sequence(self, env, offline, session):
+        a = accepted(session, "locus:GENE:enh", n_pairs=3)["design_id"]
+        b = accepted(session, "fusion:demo_junction")["design_id"]
+        text = self.store_text(env)
+        assert not DNA_RUN.findall(text)
+        for d in (a, b):
+            for res in session.designs[d].results:
+                for pair in res.pairs:
+                    assert pair.p1l not in text and pair.p1r not in text
+                    assert pair.candidate.left.seq not in text
+        for entry in mcp_store.DesignStore().all():
+            assert "results" not in entry and "pairs" not in entry
+            assert set(entry) >= {"design_id", "target_id", "params", "screen",
+                                  "pad_assignment", "run_id", "warnings", "why",
+                                  "machine", "fingerprint"}
+
+    def test_an_id_in_neither_place_is_refused_with_the_hint(self, env, offline, session):
+        accepted(session, "locus:GENE:enh")       # the store exists and is not empty
+        for call in (lambda: session.write_order(["d_nope"]),
+                     lambda: session.diagnose_design("d_nope"),
+                     lambda: session.decide_design("d_nope", "proceed", "x"),
+                     lambda: restarted().try_change("d_nope", n_pairs=2)):
+            with pytest.raises(ValueError, match="unknown design id") as info:
+                call()
+            text = str(info.value)
+            assert "design store" in text and "design_target" in text
+            assert str(env / mcp_store.LOCAL_FILENAME) in text
+
+    def test_a_design_whose_loci_entry_changed_is_not_loaded(self, env, offline, session,
+                                                             loci_file):
+        d = accepted(session, "locus:GENE:enh")["design_id"]
+        data = json.loads(loci_file.read_text())
+        data["loci"][0]["start"] += 100
+        data["loci"][0]["end"] += 100
+        loci_file.write_text(json.dumps(data))
+        later = restarted()
+        with pytest.raises(ValueError, match="did not give back the design that was recorded"):
+            later.write_order([d])
+        assert d not in later.designs, "a mismatch loads nothing"
+        assert not (env / "designs").exists()
+
+    def test_a_design_whose_target_is_gone_is_not_loaded(self, env, offline, session,
+                                                         loci_file):
+        d = accepted(session, "locus:GENE:enh")["design_id"]
+        data = json.loads(loci_file.read_text())
+        data["loci"] = []
+        loci_file.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="not in the loci file now"):
+            restarted().diagnose_design(d)
+
+    def test_a_changed_screen_outcome_is_not_loaded(self, env, stubbed, session):
+        """Same oligos, different evidence: the saved state belongs to the old evidence."""
+        stubbed("pass")
+        d = session.design_target("locus:GENE:enh")["design_id"]
+        assert session.designs[d].state.value == "succeeded"
+        stubbed("fail")
+        with pytest.raises(ValueError, match="screen configuration has changed"):
+            restarted().write_order([d])
+
+    def test_a_pipeline_failure_on_reload_is_reported_not_recorded(self, env, offline,
+                                                                   session, monkeypatch):
+        d = accepted(session, "locus:GENE:enh")["design_id"]
+        monkeypatch.setattr(pipeline, "fetch_sequence",
+                            lambda interval: (_ for _ in ()).throw(OSError("UCSC is down")))
+        later = restarted()
+        with pytest.raises(RuntimeError, match="could not be regenerated.*UCSC is down"):
+            later.write_order([d])
+        assert d not in later.designs
+        assert mcp_store.DesignStore().get(d)["machine"]["state"] == "succeeded", \
+            "a failed reload does not move the run"
+
+    def test_a_refused_design_leaves_nothing_in_the_store(self, env, session, keys):
+        """A run whose first pipeline call raised was never handed out, so there
+        is nothing a client could come back to."""
+        from mypibypy.agent.actions import ParameterRefused
+        with pytest.raises(ParameterRefused):
+            session.design_target("fusion:demo_junction", system=keys[0])
+        with pytest.raises(ValueError, match="fusion junction"):
+            session.design_target("fusion:demo_junction", n_pairs=2)
+        assert mcp_store.DesignStore().all() == []
+        assert session.status()["designs_stored"] == 0
+
+    def test_a_damaged_entry_is_refused_with_its_reason(self, env, session):
+        path = env / mcp_store.LOCAL_FILENAME
+        path.write_text(json.dumps({"design_id": "d_bad", "target_id": "locus:GENE:enh"})
+                        + "\n")
+        with pytest.raises(ValueError, match="d_bad.*not readable"):
+            session.diagnose_design("d_bad")
+        path.write_text("not json\n")
+        with pytest.raises(ValueError, match="unreadable design entry"):
+            session.write_order(["d_bad"])
+        assert "unreadable" in session.status()["designs_stored"]
+
+    def test_status_reports_the_store(self, env, offline, session):
+        st = session.status()
+        assert st["design_store"] == str(env / mcp_store.LOCAL_FILENAME)
+        assert st["designs_stored"] == 0
+        d = session.design_target("locus:GENE:enh")["design_id"]
+        st = session.status()
+        assert st["designs_stored"] == 1 and st["designs_this_session"] == [d]
+        assert not DNA_RUN.findall(json.dumps(st))
+        # A new server knows of the stored design before it has reloaded it.
+        assert restarted().status()["designs_this_session"] == []
+        assert restarted().status()["designs_stored"] == 1
+
+    def test_a_reloaded_design_is_refused_over_the_wire_with_its_reason(self, env, offline,
+                                                                        session):
+        pytest.importorskip("mcp")
+        from mcp.server.mcpserver.exceptions import ToolError
+        d = session.design_target("locus:GENE:enh")["design_id"]
+        server = mcp_server.build_server(restarted())
+        with pytest.raises(ToolError) as info:
+            asyncio.run(server.call_tool("write_order", {"design_ids": [d]}))
+        assert "'flagged'" in str(info.value) and "proceed" in str(info.value)
 
 
 class TestTroubleshooting:
@@ -596,4 +849,4 @@ def test_the_server_answers_over_stdio(env):
     # "Error executing tool write_order" with the reason left in the server log.
     assert refused.is_error
     why = "".join(getattr(c, "text", "") for c in refused.content)
-    assert "unknown design id" in why and "server restart" in why
+    assert "unknown design id" in why and "design store" in why

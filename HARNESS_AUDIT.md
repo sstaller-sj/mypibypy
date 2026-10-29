@@ -404,6 +404,15 @@ re-derived by re-running the deterministic pipeline, which is cheap) in a small
 SQLite or JSONL beside the run record, keyed by `design_id`, so a workbook can be
 written in a later conversation. Keep the sequence out of it: re-design on demand.
 
+**Applied 2026-10-29:** `mcp_store.py` keeps `mcp_designs.local.jsonl` beside the run
+record (`$MYPIBYPY_MCP_DESIGNS`), one JSON line per state change with the target id,
+parameters, screen flag, pad assignment, run id, warnings, stop reason, machine position
+and a SHA-256 digest of the oligos and verdicts -- never a sequence. A `Session` that
+does not know an id rebuilds it from its entry by running the pipeline again, refuses it
+if the digest differs (loci entry, reference or screen configuration changed), and
+otherwise keeps the saved state, so a reloaded `flagged` design still needs `proceed`.
+Tests: `tests/test_mcp_server.py::TestDesignsSurviveARestart`.
+
 ### E.4 Tool surface suggestions
 
 - `status` should include `bowtie_on_path`, `rnaplfold_on_path`, free memory and the

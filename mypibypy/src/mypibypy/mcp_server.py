@@ -22,6 +22,12 @@ accept and what it will hand back. Three of them, all structural:
 
 Every design call lands in the same run record the agent loop writes
 (`agent.record`), so an MCP-driven design is as traceable as a loop-driven one.
+Designs survive a server restart: each one's description -- target id,
+parameters, run id, warnings, state; never its oligos -- is saved to the design
+store (`mcp_store`) as it changes, and a later server rebuilds one on first use
+by running the deterministic pipeline again and checking the result against the
+digest saved with it. The state it was left in holds, so a `flagged` design from
+an earlier conversation still needs an explicit `proceed` before `write_order`.
 
 The server is thin on purpose: `pipeline` does the work, `cli.design_warnings`
 writes the provenance note, `agent.actions.clamp` bounds the numbers. Nothing
@@ -33,12 +39,13 @@ import os
 import re
 import threading
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 from . import loci as loci_mod
+from . import mcp_store
 # Not `from . import systems`: the package re-exports the function `systems`
 # under that name, which shadows the module.
 from .systems import ENV_VAR as SYSTEMS_ENV_VAR
@@ -132,6 +139,9 @@ def configure_environment(home: Path | None = None) -> Path:
             os.environ[var] = str(home / name)
     if not os.environ.get(rec.ENV_VAR):
         os.environ[rec.ENV_VAR] = str(home / rec.LOCAL_FILENAME)
+    if not os.environ.get(mcp_store.ENV_VAR):
+        # Beside the run record, wherever that was just resolved to.
+        os.environ[mcp_store.ENV_VAR] = str(mcp_store.resolve_store_path())
     if not os.environ.get(ENV_OUT_DIR):
         os.environ[ENV_OUT_DIR] = str(home / "designs")
     return home
@@ -276,19 +286,46 @@ class StoredDesign:
     machine: Machine = field(default_factory=lambda: Machine(MAX_TURNS, MAX_RELAXATIONS))
     record: rec.RunRecord | None = None
     why: str = ""
+    #: The description last written to the design store, so an unchanged one is
+    #: not written again.
+    saved: dict | None = field(default=None, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def state(self) -> State:
         return self.machine.state
 
+    def to_entry(self) -> dict:
+        """What the design store keeps: the description, and a digest of the
+        results, never the results. `Session._reload` is its inverse."""
+        m = self.machine
+        return {
+            "design_id": self.design_id,
+            "target_id": self.target_id,
+            "kind": self.target.kind if self.target else "",
+            "run_id": self.run_id,
+            "params": self.params.to_dict(),
+            "screen": self.screen,
+            "pad_assignment": self.pad_assignment,
+            "requested_pairs": self.requested_pairs,
+            "warnings": list(self.warnings),
+            "why": self.why,
+            "machine": {"state": m.state.value, "turn": m.turn,
+                        "relaxations": m.relaxations,
+                        "max_turns": m.max_turns,
+                        "max_relaxations": m.max_relaxations},
+            "fingerprint": mcp_store.fingerprint(self.results),
+        }
+
 
 @dataclass
 class Session:
     """Server state: resolved backends and the designs made so far.
 
-    Designs are held in memory only. They carry sequence, and the workbook is
-    the one place sequence is meant to leave this process.
+    Designs are held in memory with their results, which carry sequence; the
+    workbook is the one place sequence is meant to leave this process. What is
+    saved to the design store is each design's description and state, so a
+    later server can rebuild it by running the pipeline again (`_reload`).
     """
 
     genome_backend: object = None
@@ -334,6 +371,11 @@ class Session:
             loci_example = loci_mod.is_example()
         except loci_mod.LociNotConfigured as exc:
             loci_path, loci_example = f"not configured: {exc}", False
+        store = self._store()
+        try:
+            stored_count = len(store.ids())
+        except ValueError as exc:
+            stored_count = f"unreadable: {exc}"
         return {
             "systems_file": str(systems_loaded_from()),
             "systems_are_synthetic_examples": systems_are_example(),
@@ -351,6 +393,8 @@ class Session:
                 else f"NOT CONFIGURED -- {self.expression_reason}"),
             "workbook_directory": str(out_dir()),
             "run_record": str(rec.resolve_store_path()),
+            "design_store": str(store.path),
+            "designs_stored": stored_count,
             "designs_this_session": sorted(self.designs),
             "design_states": {i: d.state.value for i, d in sorted(self.designs.items())},
         }
@@ -400,6 +444,7 @@ class Session:
         self._redesign(stored)
         with self.lock:
             self.designs[design_id] = stored
+        self._save(stored)
         return self._payload(stored)
 
     def decide_design(self, design_id: str, action: str, reason: str,
@@ -468,28 +513,28 @@ class Session:
                 return self._payload(stored)
 
             self._revise(stored, decision)
+            self._save(stored)
         return self._payload(stored)
 
     def write_order(self, design_ids: list[str]) -> dict:
         if not design_ids:
             raise ValueError("no design_ids given; design_target returns one per call")
-        with self.lock:
-            missing = [d for d in design_ids if d not in self.designs]
-            if missing:
-                raise ValueError(f"unknown design id(s) {missing}; this session has "
-                                 f"{sorted(self.designs)}. Designs do not survive a "
-                                 f"server restart.")
-            chosen = [self.designs[d] for d in dict.fromkeys(design_ids)]
+        # In memory, or rebuilt from the design store: a design from an earlier
+        # conversation is ordered the same way as one from this one.
+        found = {d: self._lookup(d) for d in dict.fromkeys(design_ids)}
+        missing = [d for d, stored in found.items() if stored is None]
+        if missing:
+            raise ValueError(self._unknown(missing))
+        chosen = list(found.values())
         # The gate. A workbook carries sequence, so only a design whose run ended
         # in SUCCEEDED -- a clear pass, or an explicit decision to proceed --
         # may be written. The other states each say what to do instead.
-        blocked = {d.design_id: d.state.value for d in chosen
-                   if d.state is not State.SUCCEEDED}
+        blocked = [d for d in chosen if d.state is not State.SUCCEEDED]
         if blocked:
             raise ValueError(
                 "cannot write an order for designs that have not succeeded: "
-                + "; ".join(f"{i} is {st!r} ({self._hint(self.designs[i])})"
-                            for i, st in blocked.items()))
+                + "; ".join(f"{d.design_id} is {d.state.value!r} ({self._hint(d)})"
+                            for d in blocked))
         results = [r for d in chosen for r in d.results]
         warnings = list(dict.fromkeys(w for d in chosen for w in d.warnings))
         note = (f"mypibypy MCP order of {len(results)} design(s): "
@@ -558,12 +603,137 @@ class Session:
     # -- the machine's side of the tools --------------------------------------
 
     def _get(self, design_id: str) -> StoredDesign:
+        stored = self._lookup(design_id)
+        if stored is None:
+            raise ValueError(self._unknown([design_id]))
+        return stored
+
+    def _lookup(self, design_id: str) -> StoredDesign | None:
+        """The design from memory, else rebuilt from the design store and kept
+        in memory from then on; None if it is in neither place."""
         with self.lock:
-            if design_id not in self.designs:
-                raise ValueError(f"unknown design id {design_id!r}; this session has "
-                                 f"{sorted(self.designs)}. Designs do not survive a "
-                                 f"server restart.")
-            return self.designs[design_id]
+            stored = self.designs.get(design_id)
+        if stored is not None:
+            return stored
+        entry = self._store().get(design_id)
+        if entry is None:
+            return None
+        # The pipeline runs outside the session lock: a screen can take seconds,
+        # and `status` should answer meanwhile. If two clients reload the same
+        # id at once the first one in wins and the other's copy is dropped.
+        stored = self._reload(design_id, entry)
+        with self.lock:
+            return self.designs.setdefault(design_id, stored)
+
+    def _unknown(self, design_ids: list[str]) -> str:
+        with self.lock:
+            known = sorted(self.designs)
+        return (f"unknown design id(s) {design_ids}: not among this server's designs "
+                f"{known} and not in the design store at {self._store().path}. "
+                f"Designs are saved there as they are made and survive a server "
+                f"restart, so an id in neither place was never made by this server; "
+                f"call design_target for a new design.")
+
+    def _reload(self, design_id: str, entry: dict) -> StoredDesign:
+        """Rebuild a design saved by an earlier server.
+
+        Same target by id, same parameters, the pipeline run again, and the
+        result checked against the digest saved with the entry before the saved
+        state is trusted. Nothing here moves the run: the machine is rebuilt at
+        the state it was left in, and the gates apply to it exactly as before.
+        Every refusal is a `ValueError`/`RuntimeError`, so it reaches the client
+        with its reason.
+        """
+        try:
+            target_id = entry["target_id"]
+            saved_params, pos = dict(entry["params"]), dict(entry["machine"])
+            state = State(pos["state"])
+            turn, relaxations = int(pos["turn"]), int(pos["relaxations"])
+            screen, pads = bool(entry["screen"]), str(entry["pad_assignment"])
+            requested = int(entry["requested_pairs"])
+            run_id, why = str(entry["run_id"]), str(entry["why"])
+            warnings, digest = list(entry["warnings"]), str(entry["fingerprint"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{design_id}'s entry in the design store "
+                             f"({self._store().path}) is not readable: {exc!r}; call "
+                             f"design_target for a new design.") from exc
+        targets, _ = load_targets()
+        target = targets.get(target_id)
+        if target is None:
+            raise ValueError(
+                f"{design_id} was designed for {target_id!r}, which is not in the "
+                f"loci file now ({sorted(targets)}), so it cannot be rebuilt; call "
+                f"design_target for a new design.")
+        allowed = {f.name for f in fields(DesignParameters)}
+        params = DesignParameters(**{k: v for k, v in saved_params.items() if k in allowed})
+        try:
+            checked, clamps = clamp(params, tuple(sorted(systems())))
+        except ParameterRefused as exc:
+            raise ValueError(f"{design_id} cannot be rebuilt as it was saved: {exc}") from exc
+        if clamps or checked != params:
+            raise ValueError(
+                f"{design_id} cannot be rebuilt as it was saved: its parameters are "
+                f"outside what this server accepts ({'; '.join(map(str, clamps))}); "
+                f"call design_target for a new design.")
+        machine = Machine(max_turns=int(pos.get("max_turns", MAX_TURNS)),
+                          max_relaxations=int(pos.get("max_relaxations", MAX_RELAXATIONS)),
+                          state=state, turn=turn, relaxations=relaxations)
+        try:
+            results = self._run(target, params, screen, pads)
+        except Exception as exc:
+            raise RuntimeError(f"{design_id} could not be regenerated from the loci "
+                               f"file and the pipeline: {exc}") from exc
+        if mcp_store.fingerprint(results) != digest:
+            raise ValueError(
+                f"{design_id} was rebuilt for {target_id!r} with its saved parameters, "
+                f"but the pipeline did not give back the design that was recorded: "
+                f"the target's entry in the loci file, the reference it reads or the "
+                f"screen configuration has changed since. Its saved state "
+                f"({machine.state.value!r}) no longer describes what the pipeline "
+                f"makes, so nothing was loaded; call design_target for a new design, "
+                f"which is evaluated afresh.")
+
+        runs = rec.RunStore()
+        record = runs.get(run_id)
+        note = (f"{design_id} reloaded from the design store after a server restart; "
+                f"results regenerated by running the pipeline again, digest matched")
+        if record is None:
+            # The run record is gone (moved, or the server was pointed elsewhere):
+            # continue it under the same run id, saying so.
+            record = rec.RunRecord(
+                run_id=run_id, target=target_id, model="mcp-client",
+                request=f"continuation of {design_id} over MCP; the original run "
+                        f"record was not found in {runs.path}",
+                status=_STATUS.get(machine.state, "running"),
+                turns_used=machine.turn, relaxations_used=machine.relaxations)
+            record.log_parameters(machine.turn, params, note="as reloaded from the design store")
+            note += "; the original run record was not found, so this record continues it"
+        record.log(rec.TOOL_CALL, machine.turn, note, design_store=str(self._store().path))
+        runs.append(record)
+
+        stored = StoredDesign(
+            design_id, target_id, results, warnings, requested, run_id, target=target,
+            params=params, screen=screen, pad_assignment=pads, machine=machine,
+            record=record, why=why)
+        stored.saved = {k: v for k, v in entry.items() if k != "saved_at"}
+        return stored
+
+    def _store(self) -> mcp_store.DesignStore:
+        return mcp_store.DesignStore()
+
+    def _save(self, stored: StoredDesign) -> None:
+        """Write the design's description to the design store, if it changed.
+
+        Called wherever a run moves: the end of `design_target`, after a revision
+        in `decide_design`, and `_conclude`, which also sees the transitions that
+        end in a raise. The store is append-only, so an unchanged description is
+        not written again.
+        """
+        entry = stored.to_entry()
+        if entry == stored.saved:
+            return
+        self._store().append(entry)
+        stored.saved = entry
 
     def _redesign(self, stored: StoredDesign) -> None:
         """Run the pipeline for the design's current parameters, then evaluate."""
@@ -650,6 +820,14 @@ class Session:
         stored.record.finished_at = rec._now()
         stored.record.log(rec.OUTCOME, stored.machine.turn, f"{status}: {message}")
         rec.RunStore().append(stored.record)
+        # A design the client holds an id for is saved as it moves, including
+        # here, where a revision whose pipeline call raised ends. One whose first
+        # pipeline call raised was never handed out: `design_target` re-raises
+        # before it registers it, so there is nothing a client could come back to.
+        with self.lock:
+            handed_out = self.designs.get(stored.design_id) is stored
+        if handed_out:
+            self._save(stored)
 
     def _hint(self, stored: StoredDesign) -> str:
         """What a client can do next, in words."""
@@ -742,7 +920,10 @@ that `write_order` saves locally. Every design is a run with a state, and \
 in `flagged` stopped for a human, usually because no specificity screen ran; \
 `decide_design` with `proceed` and your reason accepts it as it is, and the \
 acceptance is recorded against the order. `decide_design` is refused in any \
-other state. `write_order` refuses a design that has not succeeded. To explain a design or troubleshoot one that \
+other state. `write_order` refuses a design that has not succeeded. Design ids \
+survive a server restart: a design from an earlier conversation can be diagnosed, \
+decided or ordered by its id, is rebuilt by running the pipeline again on first \
+use, and keeps the state it was left in. To explain a design or troubleshoot one that \
 placed too few pairs, call `diagnose_design`, and `try_change` to preview a \
 pair count or spacing; quote their sentences rather than working the numbers \
 out yourself. Report any "NOT SCREENED" specificity or \
@@ -769,8 +950,8 @@ def build_server(session: Session | None = None):
         model is told only `Error executing tool <name>` and the text stays in
         the server log. Every refusal here is deliberate and carries the hint
         the client needs next -- "call list_targets for the ids", "only applies
-        while a design is in 'decide'", "Designs do not survive a server
-        restart" -- so it is re-raised as a `ToolError`. Verified over stdio:
+        while a design is in 'decide'", "not in the design store" -- so it is
+        re-raised as a `ToolError`. Verified over stdio:
         without this, `write_order` on an unknown id came back as the generic
         line and the hint was lost, so the client could not correct itself.
         A genuine bug (anything else) still crashes, generically.
@@ -786,7 +967,8 @@ def build_server(session: Session | None = None):
     @server.tool(annotations=read_only)
     def status() -> dict:
         """Which systems and loci files are loaded, whether they are placeholders,
-        which specificity screens are configured, and where workbooks go."""
+        which specificity screens are configured, where workbooks go, and where
+        designs are kept between server runs."""
         return refusing(session.status)
 
     @server.tool(annotations=read_only)
@@ -861,9 +1043,11 @@ def build_server(session: Session | None = None):
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                                              idempotentHint=False, openWorldHint=False))
     def write_order(design_ids: list[str]) -> dict:
-        """Write one order workbook for the given design_ids (from design_target
-        in this session). Refused for any design whose state is not 'succeeded'. The server names the file and saves it in the
-        workbook directory shown by status; the path is returned."""
+        """Write one order workbook for the given design_ids (from design_target,
+        in this conversation or an earlier one: designs survive a server restart).
+        Refused for any design whose state is not 'succeeded'. The server names
+        the file and saves it in the workbook directory shown by status; the path
+        is returned."""
         return refusing(session.write_order, design_ids)
 
     return server

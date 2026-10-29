@@ -838,9 +838,19 @@ Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json
 | `MYPIBYPY_EXPRESSION` | none: off-target genes are not weighted by abundance |
 | `MYPIBYPY_MCP_OUT` | `designs/` beside `pyproject.toml` |
 | `MYPIBYPY_AGENT_RUNS` | `agent_runs.local.jsonl` beside `pyproject.toml` |
+| `MYPIBYPY_MCP_DESIGNS` | `mcp_designs.local.jsonl` beside the run record |
 
-Designs are held in memory, so `write_order` only knows designs made since the
-server started.
+**Designs survive a server restart.** Each design's description -- target id,
+parameters, screen flag, run id, warnings and its position in the state machine,
+never its oligos -- is saved to `mcp_designs.local.jsonl` (gitignored) as it
+changes, so a design made in an earlier conversation can be diagnosed, decided or
+ordered by its id. On first use a later server rebuilds it by running the
+deterministic pipeline again for the same target and parameters, and checks the
+result against a digest saved with the entry: if the loci entry, the reference or
+the screen configuration has changed since, the design is refused rather than
+loaded. The state it was left in holds, so a `flagged` design from last week still
+needs `proceed` before `write_order`, and the acceptance lands in the same run
+record. `status` reports the store path and how many designs it holds.
 
 ## Recording what happened
 

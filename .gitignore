@@ -43,9 +43,12 @@ indexes.local.json
 designs/
 
 # Design-to-result records and agent run records: both quote real probe
-# sequences (see src/mypibypy/outcomes.py and src/mypibypy/agent/record.py)
+# sequences (see src/mypibypy/outcomes.py and src/mypibypy/agent/record.py).
+# The MCP design store (src/mypibypy/mcp_store.py) quotes none, but names the
+# lab's targets
 outcomes.local.jsonl
 agent_runs.local.jsonl
+mcp_designs.local.jsonl
 *.local.jsonl
 
 # Decoy databases built by scripts/benchmark_specificity.py
