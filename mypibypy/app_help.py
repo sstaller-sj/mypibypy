@@ -17,12 +17,14 @@ def render_help(*, systems_path: Path, example: bool, screen_on: bool,
 
     st.subheader("Setup")
     st.markdown(
-        f"- {'🧪' if example else '✅'} **Amplifier systems** — `{systems_path}`"
+        f"- {':material/science:' if example else ':material/check_circle:'} "
+        f"**Amplifier systems** — `{systems_path}`"
         + (" holds the **synthetic examples**. Probes designed with them are "
            "not orderable: copy `systems.example.json` to `systems.local.json` "
            "and put your real arms / P2 / P3 / P4 in it (see the README)."
            if example else ".")
-        + f"\n- {'✅' if screen_on else '⚠️'} **Specificity screen** — "
+        + f"\n- {':material/check_circle:' if screen_on else ':material/warning:'} "
+        f"**Specificity screen** — "
         + ("a bowtie index is set." if screen_on else
            "off. Name your bowtie v1 indexes in `indexes.local.json` (copy "
            "`src/mypibypy/indexes.example.json`) and pick one under *Screen "
@@ -30,7 +32,8 @@ def render_help(*, systems_path: Path, example: bool, screen_on: bool,
            "hg38*); or enter a path under *Settings* in the sidebar. Until "
            "then every pair says NOT SCREENED and nothing establishes "
            "single-copy status.")
-        + f"\n- {'⛔' if client_kind == 'none' else '🤖'} **Decision model** — "
+        + f"\n- {':material/block:' if client_kind == 'none' else ':material/smart_toy:'} "
+        f"**Decision model** — "
         + (f"`{client_kind}`. The chat needs it to read requests; the form "
            "never does." if client_kind != "none" else
            "none. The form works; the chat cannot read requests."))

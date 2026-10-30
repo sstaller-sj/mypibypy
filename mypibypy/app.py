@@ -17,13 +17,15 @@ workspace stays readable.
 CACHING AND SEQUENCE DATA. `st.cache_data` is memory-only here on purpose --
 `persist="disk"` would write real target sequence into Streamlit's cache
 directory, and real sequences stay out of anything that could be committed or
-synced. The same goes for the workbook: it is offered as a download from memory
+synced -- and bounded (`max_entries`), so a long-running server does not hold
+every sequence it ever fetched. The same goes for the workbook: it is offered as a download from memory
 rather than written into the repo.
 """
 from __future__ import annotations
 
-import base64
 import os
+import base64
+import html
 import re
 import time
 from dataclasses import replace
@@ -214,9 +216,11 @@ def screen_label(choice: str) -> str:
     return str(screen_indexes()[0][choice])
 
 
-@st.cache_data(show_spinner="Fetching genomic sequence…")
+@st.cache_data(show_spinner="Fetching genomic sequence…", max_entries=64)
 def cached_region(build: str, chrom: str, start: int, end: int) -> str:
-    """Memory-only. Never persist=\"disk\": that writes target sequence to disk."""
+    """Memory-only. Never persist=\"disk\": that writes target sequence to disk.
+    Bounded, so a long-running server does not keep every region it ever
+    fetched; 64 is far more than a session designs against."""
     return fetch_sequence(GenomicInterval(build, chrom, start, end))
 
 
@@ -226,8 +230,9 @@ def cached_expression(path: str):
     return load_expression(path)
 
 
-@st.cache_data(show_spinner="Fetching transcript…")
+@st.cache_data(show_spinner="Fetching transcript…", max_entries=64)
 def cached_transcript(accession: str) -> str:
+    """Memory-only and bounded, like `cached_region`."""
     return fetch_transcript(accession)
 
 
@@ -355,9 +360,13 @@ def show_run_record(record) -> None:
         st.caption("Settled deterministically — the model was not consulted. "
                    "That is the expected path for a clear case.")
     for event in record.events:
-        icon = {"model_decision": "🤖", "deterministic_decision": "⚙️",
-                "parameter_clamp": "📏", "budget": "⏳", "refusal": "🚫",
-                "error": "⚠️", "outcome": "🏁"}.get(event.kind, "•")
+        icon = {"model_decision": ":material/smart_toy:",
+                "deterministic_decision": ":material/settings:",
+                "parameter_clamp": ":material/straighten:",
+                "budget": ":material/hourglass_top:", "refusal": ":material/block:",
+                "error": ":material/warning:", "outcome": ":material/flag:",
+                "transition": ":material/arrow_forward:",
+                "tool_call": ":material/build:"}.get(event.kind, "•")
         st.write(f"{icon} **turn {event.turn}** · `{event.kind}` — {event.summary}")
     with st.expander("Full record (JSON)"):
         st.json(record.to_dict())
@@ -553,13 +562,13 @@ def chat_editor(s: DesignSession, client_kind: str,
                          f"`{target}` — run #{run.number}, shown on the right.")
             if result.repacked_from:
                 lines.append(
-                    f"↔️ Placing the best-ranked windows first fit only "
+                    f":material/swap_horiz: Placing the best-ranked windows first fit only "
                     f"{result.repacked_from}, so the pairs were **re-laid out** "
                     f"across the target to fit {result.n_pairs}. That uses some "
                     f"lower-ranked windows — compare the penalties in the table.")
             if n_unscreened:
                 lines.append(
-                    f"⚠️ **No specificity screen ran** for {n_unscreened} of "
+                    f":material/warning: **No specificity screen ran** for {n_unscreened} of "
                     f"{result.n_pairs} pair(s) — nothing here establishes "
                     f"single-copy status. "
                     + no_screen_hint(screened_against, result))
@@ -895,19 +904,22 @@ def ink_colour() -> str:
     return "#F1EFE8" if getattr(theme, "type", "light") == "dark" else "#2C2C2A"
 
 
-def show_svg(svg: str) -> None:
-    """Show an SVG as an image at its own size, scrolling sideways if wider.
+def show_svg(svg: str, alt: str) -> None:
+    """Show an SVG at its own size, scrolling sideways if wider than the column.
 
-    An image rather than `st.html`, which sanitises inline SVG away. Shown at
-    native size because scaling a base-by-base drawing to a half-width column
-    shrank the bases past legibility.
+    `st.html`, not `st.image`: an image element is capped at the column's
+    width (`max-width: 100%`, even inside a horizontal container), and
+    scaling a base-by-base drawing to a half-width column shrank the bases
+    past legibility -- measured at 447 px for a 740 px drawing. The SVG goes
+    in as an `<img>` data URL rather than inline markup, which the sanitiser
+    keeps, inside a div that scrolls. No `unsafe_allow_html`.
     """
     width = re.search(r'viewBox="0 0 ([\d.]+)', svg)
     data = base64.b64encode(svg.encode()).decode()
     size = f"max-width:none;width:{width.group(1)}px" if width else "width:100%"
-    st.markdown(f'<div style="overflow-x:auto"><img src="data:image/svg+xml;'
-                f'base64,{data}" style="{size}" alt="probe pair close-up"></div>',
-                unsafe_allow_html=True)
+    st.html(f'<div style="overflow-x:auto"><img src="data:image/svg+xml;'
+            f'base64,{data}" style="{size}" alt="{html.escape(alt, quote=True)}">'
+            f'</div>')
 
 
 def _selected_pair(key: str, n_pairs: int) -> int:
@@ -960,7 +972,9 @@ def render_result(run, i: int, result, previous_run) -> None:
                  hide_index=True, alt="Key numbers for each designed pair")
 
     with st.expander(f"Pair {pair_no} close-up", expanded=True):
-        show_svg(pair_closeup_svg(result, pair_no - 1, ink=ink_colour()))
+        show_svg(pair_closeup_svg(result, pair_no - 1, ink=ink_colour()),
+                 alt=f"Pair {pair_no} close-up: the target 5' to 3' with P1L and "
+                     f"P1R bound beneath, probe bases shaded by self-folding")
         st.caption(folding_details(result)[pair_no - 1])
 
     with st.expander("All columns, folding and windows"):
@@ -968,7 +982,8 @@ def render_result(run, i: int, result, previous_run) -> None:
                      alt="Every column for each designed pair, including folding "
                          "and off-target genes")
         weighted, expression_text = expression_status(result)
-        st.caption(expression_text if weighted else f"⚠️ {expression_text}")
+        st.caption(expression_text if weighted
+                   else f":material/warning: {expression_text}")
         for line in folding_details(result):
             st.markdown(f"- {line}")
         stats = window_stats(list(result.candidates), run.params)
@@ -1001,7 +1016,7 @@ def design_panel(s: DesignSession) -> None:
     if run is s.runs[-1] and (changed_params(run.params, s.params)
                               or (s.target and str(s.target) != run.target_label
                                   and run.mode != "Fusion junction")):
-        st.caption("✏️ Edited since this run: "
+        st.caption(":material/edit: Edited since this run: "
                    + _summary_line(s.params, run.params, str(s.target or "—"))
                    + " — design again to apply.")
 
@@ -1015,7 +1030,7 @@ def design_panel(s: DesignSession) -> None:
     m3.metric("Channel", results[0].system.fluorophore)
     requested = run.params.n_pairs * len(results)
     if run.mode != "Fusion junction" and total < requested:
-        st.caption(f"⚠️ Only {total} of the {requested} requested pairs were "
+        st.caption(f":material/warning: Only {total} of the {requested} requested pairs were "
                    "placed — the tiler found no more non-overlapping windows at "
                    "this spacing among the ones it ranked.")
 
@@ -1033,7 +1048,7 @@ def design_panel(s: DesignSession) -> None:
         render_result(run, 0, results[0], previous)
 
     st.download_button(
-        "⬇️ Download order workbook (.xlsx)",
+        "Download order workbook (.xlsx)", icon=":material/download:",
         data=workbook_bytes(results, run.note),
         file_name=f"mypibypy_order_run{run.number}.xlsx", mime=XLSX,
         type="primary", key=f"download_{run.number}",
@@ -1082,12 +1097,12 @@ with st.sidebar:
 def model_line() -> str:
     """The sidebar's model line: what is actually there, not just what is selected."""
     if client_kind == "none":
-        return "⛔ Model: none — chat disabled"
+        return ":material/block: Model: none — chat disabled"
     if client_kind != "ollama":
-        return f"🤖 Model: {client_kind}"
+        return f":material/smart_toy: Model: {client_kind}"
     probe = OllamaDecisionClient()          # host and model from the environment; no call
     text, ok = ollama_health(probe.host, probe.model)
-    return f"{'🤖' if ok else '⚠️'} Model: {text}"
+    return f"{':material/smart_toy:' if ok else ':material/warning:'} Model: {text}"
 
 
 def sidebar_status() -> None:
@@ -1095,12 +1110,13 @@ def sidebar_status() -> None:
     backend, against = screen_for(session().screen)
     with status:
         st.markdown(
-            ("🧪 **Systems: synthetic examples** — not orderable" if is_example()
-             else "✅ Systems: real") + "  \n"
-            + ("⚠️ **Specificity screen: off** — pick an index in the Form"
-               if screen_is_off(against) else
-               f"⚠️ **Specificity screen: {against}**" if backend is None
-               else f"✅ Specificity screen: {against}")
+            (":material/science: **Systems: synthetic examples** — not orderable"
+             if is_example() else ":material/check_circle: Systems: real") + "  \n"
+            + (":material/warning: **Specificity screen: off** — pick an index in "
+               "the Form" if screen_is_off(against) else
+               f":material/warning: **Specificity screen: {against}**"
+               if backend is None
+               else f":material/check_circle: Specificity screen: {against}")
             + "  \n"
             + model_line())
 

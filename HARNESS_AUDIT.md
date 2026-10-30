@@ -345,6 +345,14 @@ first chat message fails. The same spot can show the free-memory warning from A.
 
 ### D.4 Smaller items
 
+> **Done 2026-10-30.** `max_entries=64` on both sequence caches; Material icons
+> replace the emoji in the sidebar, Help, run record, chat replies and the download
+> button; the `offline` test fixture now seeds one generator (it produced a
+> homopolymer before). The close-up is the exception: `st.image` caps an image at
+> the column's width (`max-width: 100%`, even inside a horizontal container), so a
+> 740 px base-by-base drawing rendered at 447 px; it stays an `<img>` data URL in a
+> scrolling div, now through `st.html` rather than `unsafe_allow_html`.
+
 - `cached_region` / `cached_transcript` have no `max_entries`; add one (sequence data
   stays in process memory for the server's lifetime otherwise).
 - `show_svg` injects HTML with `unsafe_allow_html=True`; `st.image` accepts an SVG

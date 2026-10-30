@@ -118,7 +118,8 @@ def every_tool_found(monkeypatch):
 @pytest.fixture
 def offline(monkeypatch):
     """Genomic designs without the network: a fixed random region, no repeats."""
-    seq = "".join(random.Random(11).choice("ACGT") for _ in range(600))
+    rng = random.Random(11)          # one generator: a fresh one per base gives one base
+    seq = "".join(rng.choice("ACGT") for _ in range(600))
     monkeypatch.setattr(pipeline, "fetch_sequence", lambda interval: seq)
     monkeypatch.setattr(pipeline, "rmsk_hits", lambda interval: [])
     monkeypatch.setattr(pipeline, "mask_repeats", lambda s, i, h: s)
