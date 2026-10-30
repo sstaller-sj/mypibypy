@@ -123,6 +123,24 @@ past physical RAM. Things that help, cheapest first:
   the harness only needs enum choice and a seven-field intent. A 4B Qwen3.5 at Q4 is
   ~2.5 GB. `MYPIBYPY_LOCAL_MODEL` already switches it.
 
+> **Measured 2026-10-30** with `scripts/benchmark_chat.py --loop`, one model resident
+> at a time, pinned sampler unless said. `qwen3.5:4b` (Q4_K_M, 3.3 GB pulled, 3.4 GB
+> resident against the 9B's 5.7 GB) loaded without growing swap, where loading the 9B
+> grew it from 2.9 to 6.5 GB, and ran the turns ~35 % faster (7–8.6 s against 10.7 s
+> warm). It is not a drop-in. Pinned sampler: 9/10 in 3 of 3 runs, always the same
+> turn -- "why is pair 2 worse than pair 1?" is answered correctly and then loops
+> ("please clarify which property ...") to the 512-token limit, so the user waits ~23 s
+> for the cut-off error. Modelfile sampler (presence_penalty 1.5): 10/10 twice, clean
+> reply checks, but it turns `enforce_window` on for "loosen the Tm", which the battery
+> does not score on that turn. Pinned plus `repeat_penalty 1.1`: the loop goes, but
+> "make it 6 pairs" comes back with `n_pairs` unchanged while the note promises six --
+> the penalised token is the 6, as the SAMPLING comment predicts. `qwen3.5:2b` (Q8_0,
+> 2.5 GB resident): 3× faster, 9/10, and it swaps pair 1's and pair 2's penalties to
+> agree with the question (only its inverted accessibility comparison is caught by
+> `reply_check`) and echoes the current pair count and spacing instead of "unchanged".
+> The default stays `qwen3.5:9b` (10/10, 10.7 s/turn warm, as on 10-27); switching to
+> the 4B is a sampler decision, not a model-name change.
+
 ### A.3 Setup gaps
 
 **No `indexes.local.json`.** The sidebar says "pick an index in the Form", but the
