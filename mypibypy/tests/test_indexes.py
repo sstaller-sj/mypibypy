@@ -26,6 +26,7 @@ from mypibypy.indexes import (
     OFF,
     IndexesNotConfigured,
     bowtie_index_problem,
+    kind_mismatch,
     load_indexes,
     resolve_screen,
 )
@@ -98,6 +99,22 @@ def test_a_vanished_name_screens_nothing_rather_than_the_default(monkeypatch):
     monkeypatch.setenv("MYPIBYPY_BOWTIE_INDEX", "/env/hg38")
     path, label = resolve_screen("mm10", {}, "/sidebar")
     assert path == "" and "not configured" in label
+
+
+def test_a_wrong_kind_is_explained_in_one_set_of_words(tmp_path, built):
+    """The Form warns and the MCP server refuses with this sentence; one
+    source, so they cannot drift apart."""
+    idx = load_indexes(write(tmp_path, {
+        "hg38": {"path": built},
+        "tx": {"path": built, "kind": "transcriptome"}}))
+    assert kind_mismatch(idx["hg38"], "genome") is None
+    assert kind_mismatch(idx["tx"], "transcriptome") is None
+    rna = kind_mismatch(idx["hg38"], "transcriptome")
+    assert rna.startswith("**hg38** is a genome index.")
+    assert "splice junction" in rna and "falsely clean" in rna
+    dna = kind_mismatch(idx["tx"], "genome")
+    assert dna.startswith("**tx** is a transcriptome index.")
+    assert "introns" in dna and "falsely clean" in dna
 
 
 # --- the chat side ------------------------------------------------------------

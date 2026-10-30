@@ -428,6 +428,21 @@ Tests: `tests/test_mcp_server.py::TestDesignsSurviveARestart`.
 - A read-only `list_runs` over `agent_runs.local.jsonl` (ids, targets, statuses) for
   "what did we design last week".
 
+**Applied 2026-10-29:** `status` reports which of bowtie, bowtie-build, blastn,
+RNAplfold and RNAfold are on the server's PATH (`shutil.which`), the PATH itself, free
+memory and swap (`vm_stat` and `sysctl` on macOS, `/proc/meminfo` on Linux, a sentence
+elsewhere), and the named indexes from `indexes.local.json` with whether each can run;
+`design_target` takes `screen_against`, a name from that file resolved server-side to a
+bowtie backend for exactly that index (`specificity.bowtie_backend`), refused when
+unknown (with the configured names), of the wrong kind for the target (the Form's
+sentence, shared through `indexes.kind_mismatch`) or unable to run; and the run record
+and a design's diagnosis are the resources `run://<run_id>` and
+`design://<design_id>/diagnosis`, filtered through `DNA_RUN`. Not done: the Ollama
+state (the MCP server does not use Ollama), `output_schema`, `list_runs`. `proceed`
+from `flagged` was already in place from the state-machine gating. Tests:
+`tests/test_mcp_server.py::TestStatusReportsTheMachine`, `::TestNamedScreens`,
+`::TestResources`.
+
 ## F. General and documentation
 
 ### F.1 Keep the battery as a benchmark

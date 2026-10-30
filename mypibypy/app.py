@@ -79,6 +79,7 @@ from mypibypy.indexes import (
     DEFAULT as SCREEN_DEFAULT,
     OFF as SCREEN_OFF,
     IndexesNotConfigured,
+    kind_mismatch,
     load_indexes,
     resolve_screen,
 )
@@ -737,10 +738,9 @@ def form_editor(s: DesignSession, system_keys: list[str],
         st.caption("Screen an RNA target against a **transcriptome** index — "
                    "see *Help*.")
         chosen = screen_indexes()[0].get(screen_choice)
-        if chosen is not None and chosen.kind != "transcriptome":
-            st.warning(f"**{chosen.name}** is a {chosen.kind} index. A footprint "
-                       "that spans a splice junction does not map contiguously "
-                       "to a genome, so it can look falsely clean.")
+        mismatch = kind_mismatch(chosen, "transcriptome") if chosen else None
+        if mismatch:
+            st.warning(mismatch)
         if st.button("Design probes", type="primary",
                      disabled=not (accession and gene)):
             from mypibypy.loci import RnaTarget

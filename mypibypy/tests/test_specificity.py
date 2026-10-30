@@ -31,6 +31,7 @@ from mypibypy.specificity import (
     Backend,
     Hit,
     SpecificityNotConfigured,
+    bowtie_backend,
     not_screened,
     pair_hits,
     resolve_backend,
@@ -267,6 +268,23 @@ class TestDegradesGracefully:
             resolve_backend()
         assert "MYPIBYPY_BOWTIE_INDEX" in str(exc.value)
         assert "MYPIBYPY_BLAST_DB" in str(exc.value)
+
+    def test_a_named_bowtie_index_never_falls_back_to_blast(self, tmp_path, monkeypatch):
+        """Asked for one index by name, the caller must get that index or a
+        reason -- never a quiet switch to $MYPIBYPY_BLAST_DB."""
+        monkeypatch.setenv("MYPIBYPY_BLAST_DB", str(tmp_path / "somedb"))
+        monkeypatch.setenv("PATH", "")
+        index = str(tmp_path / "hg38")
+        with pytest.raises(SpecificityNotConfigured, match="bowtie not on PATH"):
+            bowtie_backend(index)
+        monkeypatch.setattr(shutil, "which", lambda tool, *a, **k: f"/fake/bin/{tool}")
+        with pytest.raises(SpecificityNotConfigured, match="not found"):
+            bowtie_backend(index)
+        for suffix in ("1", "2", "3", "4", "rev.1", "rev.2"):
+            (tmp_path / f"hg38.{suffix}.ebwt").write_text("")
+        backend = bowtie_backend(index)
+        assert backend.tool == "bowtie" and backend.database == index
+        assert backend.executable == "/fake/bin/bowtie"
 
     def test_missing_database_file_is_not_screened(self, tmp_path, monkeypatch):
         monkeypatch.delenv("MYPIBYPY_BOWTIE_INDEX", raising=False)
