@@ -304,7 +304,67 @@ def session() -> DesignSession:
     if "design" not in state:
         state["design"] = DesignSession(
             params=DesignParameters(system=sorted(registry())[0]))
+        seed_session(state["design"])
     return state["design"]
+
+
+#: Development only. Comma-separated target ids as `list_targets` names them
+#: (`locus:Actb:promoter`, `fusion:NAME`, `rna:GENE:NAME`), each optionally
+#: `@index` -- a name from indexes.local.json, or `off`. A new session designs
+#: them before it draws, so a browser refresh or a server restart lands on a
+#: filled-in design panel instead of an empty one while the layout is being
+#: worked on. Unset in real use.
+ENV_SEED = "MYPIBYPY_UI_SEED"
+
+
+def seed_session(s: DesignSession) -> None:
+    """Design each `$MYPIBYPY_UI_SEED` target into `s`, as the form would."""
+    seeds = [x.strip() for x in os.environ.get(ENV_SEED, "").split(",") if x.strip()]
+    if not seeds:
+        return
+    from mypibypy.mcp_server import load_targets   # the MCP server's ids
+    targets, _ = load_targets()
+    for seed in seeds:
+        target_id, _, screen = seed.partition("@")
+        target = targets.get(target_id)
+        if target is None:
+            st.warning(f"`{ENV_SEED}`: no target `{target_id}`. Known: "
+                       + (", ".join(f"`{t}`" for t in sorted(targets)) or "none"))
+            continue
+        if screen not in (SCREEN_DEFAULT, SCREEN_OFF, *screen_indexes()[0]):
+            st.warning(f"`{ENV_SEED}`: no index `{screen}` for `{target_id}`.")
+            continue
+        backend, screened_against = screen_for(screen)
+        obj, params, form_target = target.obj, s.params, None
+        with st.spinner(f"Seeding {target_id}…"):
+            if target.kind == "fusion":
+                mode, label = "Fusion junction", f"fusion {obj.name}"
+                results = run_design(design_fusion, obj, backend=backend,
+                                     screen=backend is not None)
+            else:
+                params = replace(params, system=obj.system)
+                kw = dict(backend=backend, screen=backend is not None,
+                          n_pairs=params.n_pairs, min_spacing=params.min_spacing)
+                if target.kind == "rna":
+                    mode, label = "RNA transcript", obj.accession
+                    form_target = target_from_form(mode, accession=obj.accession)
+                    seq = run_design(cached_transcript, obj.accession)
+                    one = seq and run_design(design_rna, obj, transcript_seq=seq, **kw)
+                else:
+                    iv = obj.interval
+                    mode = "Genomic region"
+                    label = f"{iv.build} {iv.chrom}:{iv.start:,}-{iv.end:,}"
+                    form_target = target_from_form(mode, build=iv.build,
+                                                   chrom=iv.chrom, start=iv.start,
+                                                   end=iv.end)
+                    one = run_design(design_locus, obj, **kw)
+                results = [one] if one else None
+        if not results:
+            continue
+        s.update(params=params, target=form_target)
+        s.screen = screen
+        s.record(source="seed", results=results, note=f"mypibypy UI: {target_id}.",
+                 target_label=label, mode=mode, screen=screened_against)
 
 
 def windows_for(run, i: int) -> list:

@@ -8,3 +8,8 @@ toolbarMode = "minimal"
 # the live one on 8507 while the browser tab stayed on 8501. A pinned port fails
 # loudly instead. .claude/launch.json uses the same number.
 port = 8533
+# Rerun the open tab when a source file is saved, instead of showing the
+# "Source file changed" banner. A rerun keeps st.session_state, so designs and
+# the chat survive a layout edit; a browser refresh starts a new session and
+# loses them.
+runOnSave = true

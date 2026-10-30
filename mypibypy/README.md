@@ -689,6 +689,19 @@ there is no need for a job queue, progress streaming or async machinery.
 The pure logic lives in `mypibypy/ui.py` so it can be tested without a browser;
 the layout was verified by running the app.
 
+**Working on the layout.** `.streamlit/config.toml` sets `runOnSave`, so saving
+a file reruns the open tab and keeps its designs. A browser refresh or a
+restart starts an empty session; to have it open on a design instead, name
+targets from your loci file (the ids `list_targets` uses), each optionally
+`@index` or `@off`:
+
+```bash
+MYPIBYPY_UI_SEED=locus:Actb:promoter,fusion:demo_junction@off streamlit run app.py
+```
+
+Each new session designs those first, as the form would, and lists them in the
+run picker as `seed` runs. Leave it unset in real use.
+
 ### Chat
 
 Switch **Interface** to *Chat* and talk to it:

@@ -65,6 +65,32 @@ class TestBoot:
         assert "not reachable" in text and "127.0.0.1:9" in text
 
 
+class TestSeed:
+    """`$MYPIBYPY_UI_SEED` designs into a new session, for layout work."""
+
+    @pytest.fixture(autouse=True)
+    def example_loci(self, monkeypatch):
+        # The example fusion carries its own sequence: no fetch, no network.
+        monkeypatch.setenv("MYPIBYPY_LOCI",
+                           str(APP_DIR / "src/mypibypy/loci.example.json"))
+
+    def test_a_seeded_session_opens_on_the_design(self, app, monkeypatch):
+        monkeypatch.setenv("MYPIBYPY_UI_SEED", "fusion:demo_junction@off")
+        at = app.run()
+        assert not at.exception
+        picker = next(sb for sb in at.selectbox if sb.label == "Run")
+        assert picker.options == ["#1 · seed · fusion demo_junction · 2 pairs"]
+        assert [m.value for m in at.metric][1] == "not run"
+
+    def test_an_unknown_seed_is_named_and_skipped(self, app, monkeypatch):
+        monkeypatch.setenv("MYPIBYPY_UI_SEED", "locus:NOPE:none")
+        at = app.run()
+        assert not at.exception
+        assert "no target `locus:NOPE:none`" in at.warning[0].value
+        assert "fusion:demo_junction" in at.warning[0].value
+        assert "Nothing designed yet" in " ".join(c.value for c in at.caption)
+
+
 class TestChat:
     def test_a_design_request_designs_and_keeps_the_run(self, app, monkeypatch):
         key = sorted(systems())[0]
