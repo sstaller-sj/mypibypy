@@ -19,10 +19,9 @@ its specificity, and it is what this tool designs and checks against.
 ## Quick start
 
 ```bash
-conda create -n pifish-tools -c conda-forge -c bioconda \
-    python=3.11 blast bowtie bowtie2 samtools viennarna openpyxl pytest
+conda env create -f environment.yml    # tools, UI and the package itself
 conda activate pifish-tools
-cd mypibypy && pip install -e . && pytest
+cd mypibypy && pytest
 ```
 
 ```bash

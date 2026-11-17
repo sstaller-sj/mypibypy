@@ -1,0 +1,41 @@
+# The mypibypy environment: Python, the command-line tools the screens shell
+# out to, the browser UI, and the package itself in editable mode.
+#
+#     conda env create -f environment.yml
+#     conda activate pifish-tools
+#     cd mypibypy && pytest
+#
+# macOS and Linux only: bioconda builds none of the aligners for Windows. On
+# Windows use WSL2, or a container built from this file.
+#
+# Not here, because conda cannot supply them: the bowtie indexes to screen
+# against (see "Pair-aware genome screening" in mypibypy/README.md) and Ollama
+# with its model for the chat (see "Which model"). Both are optional; without
+# an index a design says NOT SCREENED, and without a model the Form still works.
+name: pifish-tools
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  # External programs. Each is optional at runtime: a feature whose program is
+  # missing reports not-screened / not-evaluated instead of failing.
+  - bowtie>=1.3.1        # the specificity screen (bowtie 1, not bowtie2)
+  - blast>=2.17          # blastn / makeblastdb: amplifier-pool cross-hybridization
+  - viennarna>=2.7       # RNAplfold (site accessibility), RNAfold (probe folding)
+  - bowtie2>=2.5         # only scripts/benchmark_specificity.py's backend comparison
+  # The package's own dependencies (pyproject.toml), from conda where they exist
+  - openpyxl>=3.1
+  - biopython>=1.80
+  - pydantic>=2.5
+  # The browser UI (app.py) and its probe map
+  - streamlit>=1.66
+  - pandas
+  - altair
+  - pytest>=8
+  - pip:
+      # The package, editable, with the MCP server (`python -m mypibypy mcp`).
+      # The path is relative to this file.
+      - -e ./mypibypy[mcp]

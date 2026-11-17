@@ -62,14 +62,17 @@ sequences and target/fusion designs. Keep them in a local `designs/` directory.
 ## Setup
 
 The design core is pure Python, but specificity screening shells out to BLAST
-and bowtie, which are not pip-installable. Create the environment with conda:
+and bowtie, which are not pip-installable. Create the environment with conda,
+from the repository root; `environment.yml` there lists the tools, the UI's
+packages and this package in editable mode with the MCP server:
 
 ```bash
-conda create -n pifish-tools -c conda-forge -c bioconda \
-    python=3.11 blast bowtie bowtie2 samtools viennarna openpyxl pytest
+conda env create -f environment.yml
 conda activate pifish-tools
-pip install -e .          # from this directory
 ```
+
+macOS and Linux only: bioconda has no Windows builds of the aligners, so on
+Windows use WSL2.
 
 Then configure your amplifier systems (see below) and run the tests:
 
