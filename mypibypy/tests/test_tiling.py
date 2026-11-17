@@ -186,6 +186,23 @@ class TestEveryPairIsScreened:
         built = make_result(sys_a, region, 4)
         assert len({id(s) for _, s, _ in built.rows()}) == 4
 
+    def test_design_locus_gives_every_pair_the_dna_accessibility_reason(
+            self, sys_a, region, monkeypatch):
+        """Pairs 2+ of a tiled DNA design used to read "no accessibility
+        recorded for this pair", as if one had been expected and lost."""
+        from mypibypy import pipeline
+        seq, iv = region
+        monkeypatch.setattr(pipeline, "fetch_sequence", lambda interval: seq)
+        monkeypatch.setattr(pipeline, "rmsk_hits", lambda interval: [])
+        monkeypatch.setattr(pipeline, "mask_repeats", lambda s, i, h: s)
+        monkeypatch.setattr(pipeline, "screen_pair",
+                            lambda left, right, backend=None, **kw: not_screened("stub"))
+        locus = Locus("prom", "Gene1", "synthetic", iv, sorted(systems())[0])
+        res = pipeline.design_locus(locus, n_pairs=4, check_folding=False)
+        reasons = [access.reason for _, _, access in res.rows()]
+        assert len(reasons) == 4
+        assert len(set(reasons)) == 1 and "DNA target" in reasons[0]
+
 
 class TestFusionRefusesTiling:
     """A junction is one position -- the design IS the gap on the breakpoint."""

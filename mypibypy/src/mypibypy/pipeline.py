@@ -43,6 +43,13 @@ from .specificity import Backend, SpecificityReport, not_screened, screen_pair
 from .systems import AmplifierSystem, get_system
 
 
+def _dna_accessibility() -> AccessibilityResult:
+    """Why a DNA target carries no accessibility: said per pair, not once."""
+    return not_evaluated(
+        "DNA target: the protocol denatures it, so target-site secondary "
+        "structure does not gate binding")
+
+
 @dataclass
 class DesignResult:
     locus: Locus
@@ -56,9 +63,7 @@ class DesignResult:
     #: denatured by the protocol, so the question does not arise there, and a
     #: genomic design carries an explicit "not applicable" rather than a number.
     accessibility: AccessibilityResult = field(
-        default_factory=lambda: not_evaluated(
-            "DNA target: the protocol denatures it, so target-site secondary "
-            "structure does not gate binding"))
+        default_factory=lambda: _dna_accessibility())
     #: Every pair ordered for this locus, in genomic/transcript order. A
     #: single-pair design leaves these empty and they fall back to the single
     #: `pair`/`specificity`/`accessibility` above, so nothing that predates
@@ -189,6 +194,10 @@ def design_locus(locus: Locus, top: int = 5, backend: Backend | None = None,
                 not_screened("genome screen skipped by request (screen=False)"))
     return DesignResult(locus, system, seq, cands, pairs[0], rmsk, screens[0],
                         pairs=pairs, pair_screens=screens,
+                        # Every tiled pair, not only the first: otherwise pairs
+                        # 2+ read "no accessibility recorded", as if one had
+                        # been expected.
+                        pair_accessibility=[_dna_accessibility() for _ in pairs],
                         pair_folding=_folding(pairs, check_folding),
                         repacked_from=repacked_from, packing_solved=n_pairs > 1)
 
