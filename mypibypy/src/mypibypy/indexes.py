@@ -14,7 +14,7 @@ Resolution order, the same shape as `systems` and `loci`:
 2. ``$MYPIBYPY_INDEXES``.
 3. ``indexes.local.json`` in the current directory or any parent (gitignored).
 
-No file is fine: the screen is then set by path (the app's sidebar, or
+No file is fine: the screen is then set by path (the app's Settings, or
 ``$MYPIBYPY_BOWTIE_INDEX``) or not at all. Format:
 
     {"indexes": {
@@ -39,7 +39,7 @@ KINDS = ("genome", "transcriptome")
 
 #: The choice that turns the screen off for a design, whatever is configured.
 OFF = "off"
-#: The choice that defers to the path set outside the session (sidebar / env).
+#: The choice that defers to the path set outside the session (Settings / env).
 DEFAULT = ""
 
 #: Index names become enum values the model may return, so they are kept to
@@ -161,7 +161,7 @@ def resolve_screen(choice: str, indexes: dict[str, ScreenIndex],
     """(bowtie basename to screen against, label for it). Empty path = no screen.
 
     `choice` is a session's screen setting: a configured name, `OFF`, or
-    `DEFAULT`, which uses `fallback_path` (the sidebar box), then
+    `DEFAULT`, which uses `fallback_path` (the Settings box), then
     ``$MYPIBYPY_BOWTIE_INDEX``. A name that is no longer configured screens
     nothing rather than falling back -- the user asked for that index, not
     for whichever one happens to be the default.

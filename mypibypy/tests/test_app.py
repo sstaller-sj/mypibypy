@@ -49,45 +49,88 @@ def scripted(monkeypatch, replies):
         lambda kind=None, **kw: ScriptedClient(structured_replies=[queue.pop(0)]))
 
 
+def on_workspace(app) -> AppTest:
+    """Run the app and press Home's button. Later runs stay on the Workspace."""
+    return app.run().button(key="open_workspace").click().run()
+
+
+@pytest.fixture
+def example_loci(monkeypatch):
+    # The example fusion carries its own sequence: no fetch, no network.
+    monkeypatch.setenv("MYPIBYPY_LOCI", str(APP_DIR / "src/mypibypy/loci.example.json"))
+
+
 def shown(at) -> str:
     return " ".join(m.value for m in at.markdown)
 
 
 class TestBoot:
     def test_the_app_renders_without_exceptions(self, app):
-        at = app.run()
+        at = on_workspace(app)
         assert not at.exception
         assert "Current design" in [h.value for h in at.subheader]
 
-    def test_the_sidebar_says_the_model_is_unreachable_not_merely_selected(self, app):
-        at = app.run()
-        text = " ".join(m.value for m in at.sidebar.markdown)
+    def test_the_status_says_the_model_is_unreachable_not_merely_selected(self, app):
+        at = on_workspace(app)
+        assert not at.sidebar.children     # status and settings are in the header
+        text = shown(at)
         assert "not reachable" in text and "127.0.0.1:9" in text
 
 
+class TestHome:
+    def test_the_app_opens_on_home(self, app):
+        at = app.run()
+        assert not at.exception
+        assert [t.value for t in at.title] == ["mypibypy"]
+        assert at.button(key="open_workspace").label == "Open the workspace"
+
+    def test_the_workspace_opens_on_the_form_when_the_tutorial_asks(self, app):
+        """The tutorial's button sets `open_editor` and switches page. AppTest
+        cannot open a function page, so this sets the flag the button sets."""
+        at = app.run()
+        at.session_state["open_editor"] = "Form"
+        at.button(key="open_workspace").click().run()
+        assert not at.exception
+        assert at.segmented_control(key="editor").value == "Form"
+        assert "open_editor" not in at.session_state
+
+    def test_the_tutorial_walks_through_the_example_locus(self, monkeypatch):
+        monkeypatch.syspath_prepend(str(APP_DIR))
+
+        def page():
+            from pathlib import Path
+
+            from app_help import render_tutorial
+            from mypibypy import loci
+            example = Path(loci.__file__).parent / loci.EXAMPLE_FILENAME
+            render_tutorial(loci.load_loci(example)[0], 6)
+
+        at = AppTest.from_function(page).run()
+        assert not at.exception
+        assert at.button(key="tutorial_fill").label == "Fill in the Form with this example"
+        text = shown(at)
+        assert "mm10 chr5:142906255-142906754" in text and "6 pairs" in text
+
+
+@pytest.mark.usefixtures("example_loci")
 class TestSeed:
     """`$MYPIBYPY_UI_SEED` designs into a new session, for layout work."""
 
-    @pytest.fixture(autouse=True)
-    def example_loci(self, monkeypatch):
-        # The example fusion carries its own sequence: no fetch, no network.
-        monkeypatch.setenv("MYPIBYPY_LOCI",
-                           str(APP_DIR / "src/mypibypy/loci.example.json"))
-
     def test_a_seeded_session_opens_on_the_design(self, app, monkeypatch):
         monkeypatch.setenv("MYPIBYPY_UI_SEED", "fusion:demo_junction@off")
-        at = app.run()
+        at = on_workspace(app)
         assert not at.exception
         picker = next(sb for sb in at.selectbox if sb.label == "Run")
         assert picker.options == ["#1 · seed · fusion demo_junction · 2 pairs"]
-        assert [m.value for m in at.metric][1] == "not run"
+        assert [m.value for m in at.metric][1] == "none"
 
     def test_an_unknown_seed_is_named_and_skipped(self, app, monkeypatch):
         monkeypatch.setenv("MYPIBYPY_UI_SEED", "locus:NOPE:none")
-        at = app.run()
+        at = app.run()          # the warning is on whichever page opens first
         assert not at.exception
         assert "no target `locus:NOPE:none`" in at.warning[0].value
         assert "fusion:demo_junction" in at.warning[0].value
+        at.button(key="open_workspace").click().run()
         assert "Nothing designed yet" in " ".join(c.value for c in at.caption)
 
 
@@ -95,7 +138,7 @@ class TestChat:
     def test_a_design_request_designs_and_keeps_the_run(self, app, monkeypatch):
         key = sorted(systems())[0]
         scripted(monkeypatch, [intent(system=key, n_pairs=2)])
-        at = app.run()
+        at = on_workspace(app)
         at.chat_input[0].set_value(f"design 2 pairs in {key} for {SEQ}").run()
         assert not at.exception
         assert "run #1" in shown(at)
@@ -114,7 +157,7 @@ class TestChat:
             intent(intent="change",
                    note="I will loosen the Tm constraints and run the design again."),
         ])
-        at = app.run()
+        at = on_workspace(app)
         at.chat_input[0].set_value(f"design 2 pairs in {key} for {SEQ}").run()
         at.chat_input[0].set_value("too few passed, loosen the Tm").run()
         assert not at.exception
@@ -130,7 +173,7 @@ class TestChat:
             intent(system=key, n_pairs=2),
             intent(intent="change", n_pairs=3, note="Three pairs it is."),
         ])
-        at = app.run()
+        at = on_workspace(app)
         at.chat_input[0].set_value(f"design 2 pairs in {key} for {SEQ}").run()
         at.chat_input[0].set_value("make it 3 pairs").run()
         assert not at.exception
@@ -149,7 +192,7 @@ class TestFormAgentLoop:
         monkeypatch.setattr(pipeline, "fetch_sequence", lambda interval: SEQ)
         monkeypatch.setattr(pipeline, "rmsk_hits", lambda interval: [])
         monkeypatch.setattr(pipeline, "mask_repeats", lambda s, i, h: s)
-        at = app.run()
+        at = on_workspace(app)
         at.segmented_control(key="editor").set_value("Form").run()
         at.text_input(key="f_region_0").set_value("chr1:1000-1399")
         at.checkbox(key="f_agent").check().run()      # enables the button
@@ -162,3 +205,111 @@ class TestFormAgentLoop:
         assert "without consulting the model" in verdicts[0]
         captions = " ".join(c.value for c in at.caption)
         assert "model was not consulted" in captions
+
+
+class TestBatch:
+    """AppTest cannot drive a file uploader, so the upload is handed in by
+    replacing `st.file_uploader`; everything after it is the real editor."""
+
+    @staticmethod
+    def upload(monkeypatch, rows: dict[str, list[tuple]], name="order.xlsx"):
+        import io
+        import streamlit
+        from openpyxl import load_workbook
+        from mypibypy.batch_sheet import template_bytes
+
+        wb = load_workbook(io.BytesIO(template_bytes(sorted(systems()))))
+        for title, values in rows.items():
+            for r, row in enumerate(values, start=2):
+                for c, value in enumerate(row, start=1):
+                    wb[title].cell(row=r, column=c, value=value)
+        buf = io.BytesIO()
+        wb.save(buf)
+
+        class Uploaded:
+            def getvalue(self):
+                return buf.getvalue()
+        Uploaded.name = name
+        monkeypatch.setattr(streamlit, "file_uploader", lambda *a, **kw: Uploaded())
+
+    @staticmethod
+    def no_network(monkeypatch):
+        from mypibypy import pipeline
+        monkeypatch.setattr(pipeline, "fetch_sequence", lambda interval: SEQ)
+        monkeypatch.setattr(pipeline, "rmsk_hits", lambda interval: [])
+        monkeypatch.setattr(pipeline, "mask_repeats", lambda s, i, h: s)
+
+    def test_the_template_is_offered_before_anything_is_uploaded(self, app):
+        at = on_workspace(app)
+        at.segmented_control(key="editor").set_value("Batch").run()
+        assert not at.exception
+        assert at.download_button(key="batch_template").label == "Download the template"
+        assert "Up to 50 targets" in " ".join(c.value for c in at.caption)
+
+    def test_an_upload_designs_its_good_rows_into_one_run(self, app, monkeypatch,
+                                                          example_loci):
+        import datetime as dt
+        from mypibypy.loci import load_fusions
+        self.no_network(monkeypatch)
+        key = sorted(systems())[0]
+        fusion = load_fusions(APP_DIR / "src/mypibypy/loci.example.json")[0]
+        self.upload(monkeypatch, {
+            "Genomic regions": [
+                ("a", "GENEA", "hg38", "chr1", 1000, 1399, key),
+                ("b", dt.datetime(2026, 9, 7), "hg38", "chr1", 5000, 5399, key),
+            ],
+            "Fusion junctions": [(fusion.name, fusion.five_prime_gene,
+                                  fusion.three_prime_gene, fusion.sequence,
+                                  fusion.breakpoint, key)],
+            "Sequences": [("enh", "MYOD1", f">enhancer\n{SEQ}", key)],
+        })
+        at = on_workspace(app)
+        at.segmented_control(key="editor").set_value("Batch").run()
+        assert not at.exception
+        warning = at.warning[0]
+        assert "Excel turned gene into a date" in warning.value
+        assert at.selectbox(key="b_screen_sequence")   # pasted sequences pick their own
+        at.number_input(key="b_pairs").set_value(2)
+        at.button(key="b_design").click().run()
+        assert not at.exception
+
+        run = at.session_state["design"].current
+        assert run.source == "batch" and run.mode == "Batch"
+        # A region, both fusion strands, and the pasted sequence.
+        assert len(run.results) == 4
+        assert [bool(line.results) for line in run.batch] == [True, False, True, True]
+        assert run.results[3].region_seq == SEQ
+        assert "Excel turned gene into a date" in run.batch[1].problem
+        assert run.params.n_pairs == 2
+        metrics = {m.label: m.value for m in at.metric}
+        assert metrics["Targets designed"] == "3 of 4"
+        assert "not in the workbook" in " ".join(w.value for w in at.warning)
+        assert len(at.selectbox(key=f"batch_show_{run.number}").options) == 4
+        assert at.download_button(key=f"download_{run.number}")
+
+        # One order: the region's and the sequence's two tiled pairs, and
+        # both fusion strands.
+        import io
+        from openpyxl import load_workbook
+        from mypibypy.ui import workbook_bytes
+        order = load_workbook(io.BytesIO(workbook_bytes(run.results, run.note)))
+        names = {row[0] for row in order["ORDER_ssDNA"].iter_rows(
+            min_row=2, values_only=True) if row[0]}
+        assert {"P1L_GENEA_a_t01", "P1R_GENEA_a_t02", "P1L_MYOD1_enh_t01",
+                f"P1L_{fusion.name}_sense", f"P1R_{fusion.name}_antisense"} <= names
+
+    def test_a_file_that_is_not_a_workbook_is_refused_in_words(self, app,
+                                                                monkeypatch):
+        import streamlit
+
+        class Uploaded:
+            name = "targets.csv"
+
+            def getvalue(self):
+                return b"name,gene\npromoter,Actb\n"
+        monkeypatch.setattr(streamlit, "file_uploader", lambda *a, **kw: Uploaded())
+        at = on_workspace(app)
+        at.segmented_control(key="editor").set_value("Batch").run()
+        assert not at.exception
+        assert "not an Excel workbook" in at.error[0].value
+        assert all(b.key != "b_design" for b in at.button)

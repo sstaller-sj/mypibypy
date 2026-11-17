@@ -28,7 +28,7 @@ class Run:
     """One press of Design, or one chat turn that designed. Kept, not replaced."""
 
     number: int
-    source: str                     # "form" | "chat"
+    source: str                     # "form" | "chat" | "batch"
     results: list                   # list[DesignResult]; two for a fusion
     note: str                       # goes into the workbook
     params: DesignParameters
@@ -36,6 +36,8 @@ class Run:
     mode: str = ""                  # the form's target type, or "chat"
     agent: object | None = None     # the agent's RunOutcome, when the loop ran
     screen: str = ""                # what it was screened against, or "off"
+    #: A batch run's `BatchLine`s, one per uploaded row; empty otherwise.
+    batch: list = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -51,7 +53,7 @@ class DesignSession:
     runs: list[Run] = field(default_factory=list)
     selected: int = -1              # index into `runs`; -1 is the latest
     #: The specificity-screen choice: a name from `indexes`, `indexes.OFF`,
-    #: or `indexes.DEFAULT` (the sidebar path / $MYPIBYPY_BOWTIE_INDEX). Not a
+    #: or `indexes.DEFAULT` (the Settings path / $MYPIBYPY_BOWTIE_INDEX). Not a
     #: `DesignParameters` field: the agent loop may vary those, and which
     #: genome to screen against is never the loop's to change.
     screen: str = ""
@@ -79,7 +81,7 @@ class DesignSession:
 
     def record(self, *, source: str, results: list, note: str,
                target_label: str, mode: str = "", agent=None,
-               screen: str = "") -> Run:
+               screen: str = "", batch: list | None = None) -> Run:
         """Keep a finished design and select it.
 
         `screen` is the label of what was actually screened against, which
@@ -88,7 +90,7 @@ class DesignSession:
         run = Run(number=len(self.runs) + 1, source=source, results=results,
                   note=note, params=replace(self.params),
                   target_label=target_label, mode=mode, agent=agent,
-                  screen=screen)
+                  screen=screen, batch=list(batch or []))
         self.runs.append(run)
         self.selected = -1
         return run

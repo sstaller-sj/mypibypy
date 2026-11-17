@@ -139,6 +139,7 @@ example systems or example loci are in use -- those outputs are not orderable.
 | `ui.py`          | presentation helpers for the Streamlit app (testable apart from it) |
 | `mcp_server.py`  | the pipeline as MCP tools for Claude Desktop / Claude Code       |
 | `workbook.py`    | render the order workbook (ORDER_ssDNA / Parts list / per-locus) |
+| `batch_sheet.py` | the UI's batch template (.xlsx) and the reader for a filled-in one |
 | `cli.py`         | `python -m mypibypy`                                             |
 
 ## QC and specificity
@@ -700,7 +701,38 @@ MYPIBYPY_UI_SEED=locus:Actb:promoter,fusion:demo_junction@off streamlit run app.
 ```
 
 Each new session designs those first, as the form would, and lists them in the
-run picker as `seed` runs. Leave it unset in real use.
+run picker as `seed` runs. The app opens on Home; refresh at `/workspace` to
+land on the design itself. Leave it unset in real use.
+
+### Batch
+
+For an order of several targets, switch the editor to **Batch**, download the
+template, and fill in one row per target. Three of its sheets (*Genomic
+regions*, *RNA transcripts*, *Fusion junctions*) use the loci file's field
+names, and the loci loader's own checks build each row, so a row there and an
+entry in `loci.local.json` mean the same thing. The fourth, *Sequences*, takes
+raw bases as the Form's *Pasted sequence* does, with the same checks. Upload
+it, choose the pair count, the spacing and a screen for each kind (a genome for
+regions and fusions, a transcriptome for transcripts, either for pasted
+sequences), and every row is designed into one run and one order workbook. Up
+to 50 targets per upload.
+
+- Text columns are formatted as Text, because Excel turns SEPT7 or MARCH1 into
+  a date as it is typed. A date in a text column is refused with that reason
+  rather than guessed back into a gene.
+- A pasted sequence is designed as a transcript, as in the Form. Give it a real
+  gene symbol and a transcriptome screen ignores hits to the target's own gene;
+  a genome screen may still report the target's own site, since the sequence
+  has no position. An Excel cell holds at most 32,767 characters, and Excel cuts
+  a longer paste to that silently, so a sequence of exactly that length is
+  refused as probably truncated; paste longer ones into the Form.
+- A row that cannot be read or designed is listed with the reason and left out
+  of the workbook; the rest go ahead. Two rows that would give their oligos the
+  same `P1L_<gene>_<name>` are refused, since they could not be told apart on
+  the order sheet.
+- The upload is read from memory and never saved. Uploaded targets are designed
+  in the UI only; they are not added to the loci file, so the MCP server, which
+  addresses targets by loci-file id, does not see them.
 
 ### Chat
 

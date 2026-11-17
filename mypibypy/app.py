@@ -7,12 +7,17 @@ no progress streaming and no async machinery here. The alternative considered
 was the React path (React + MUI + Vite, a FastAPI backend, auth, two repos,
 thousands of lines); for this surface it would be more framework than feature.
 
-LAYOUT. One Workspace page and a Help page. The workspace has two editors on
-the left -- Chat and Form -- and the current design on the right. Both editors
-change the same `DesignSession` (parameters, target, kept runs), so a tweak in
-the chat shows up in the form and in the design panel, and there is one
-download for whichever run is selected. Long explanations live on Help so the
-workspace stays readable.
+LAYOUT. Home, Workspace, Tutorial and Help, under a header with the status
+badges and Settings. Home is where the app opens: what it does, the way into
+the workspace, and links to the tutorial, Help and the README. The tutorial
+walks one design of the example Actb locus and can fill the Form in with it.
+The workspace has three editors on the left -- Chat, Form and Batch -- and the
+current design on the right. They all change the same
+`DesignSession` (parameters, target, kept runs), so a tweak in the chat shows
+up in the form and in the design panel, and there is one download for
+whichever run is selected. Batch designs every row of an uploaded template
+(`batch_sheet`) as one run, for an order of several targets. Long explanations live on Help so the workspace
+stays readable.
 
 CACHING AND SEQUENCE DATA. `st.cache_data` is memory-only here on purpose --
 `persist="disk"` would write real target sequence into Streamlit's cache
@@ -36,7 +41,7 @@ import streamlit as st
 # `systems`/`loci`/`indexes` search the working directory and its PARENTS, which works for
 # the CLI (run from the package directory) but not for a UI that may be launched
 # from the repository root. Point them at the files next to this script when
-# nothing else is configured, so the app behaves the same either way. The sidebar
+# nothing else is configured, so the app behaves the same either way. Settings
 # always shows which file was actually loaded, so this can never be ambiguous.
 _HERE = Path(__file__).resolve().parent
 for _var, _name in (("MYPIBYPY_SYSTEMS", "systems.local.json"),
@@ -75,6 +80,14 @@ from mypibypy.agent.intent import (
 from mypibypy.agent.context import ScreenStatus, build_chat_context, facts_reply
 from mypibypy.agent.reply_check import checked_note, retry_request
 from mypibypy.agent.tools import window_stats
+from mypibypy.batch_sheet import (
+    MAX_TARGETS,
+    TEMPLATE_FILENAME,
+    BatchLine,
+    BatchSheetError,
+    read_batch,
+    template_bytes,
+)
 from mypibypy.diagnosis import PREVIEW_CAVEAT, try_changes, windows_text
 from mypibypy.design import DEFAULT_MIN_SPACING_NT
 from mypibypy.indexes import (
@@ -108,7 +121,7 @@ from mypibypy.ui import (
     workbook_bytes,
 )
 
-from app_help import render_help
+from app_help import render_help, render_tutorial
 
 ICON_PATH = Path(__file__).parent / "assets" / "icon.png"
 st.set_page_config(page_title="mypibypy", page_icon=str(ICON_PATH), layout="wide")
@@ -135,6 +148,8 @@ TARGET_TYPES = ["Genomic region", "RNA transcript", "Pasted sequence",
 #: The chat's target kinds, mapped onto the form's target types.
 KIND_TO_TYPE = {"genomic": "Genomic region", "rna": "RNA transcript",
                 "sequence": "Pasted sequence"}
+#: `Run.mode` of a run designed from an uploaded template.
+BATCH_MODE = "Batch"
 #: Columns of the compact table in the design panel; the rest are one click away.
 KEY_COLUMNS = ["#", "footprint", "Tm L", "Tm R", "specificity",
                "worst off-target P(bound)", "self-folding"]
@@ -178,7 +193,7 @@ def screen_for(choice: str):
     """(backend or None, label) for a session's screen choice.
 
     The label is what the run records and the user reads: a name, a path for
-    the sidebar/env fallback, "off", or -- when an index was chosen but the
+    the Settings/env fallback, "off", or -- when an index was chosen but the
     screen cannot start (bowtie missing, say) -- the name and the reason, so
     nobody is told to "pick an index" they already picked.
     """
@@ -199,10 +214,10 @@ def screen_status(choice: str) -> ScreenStatus:
     named = screen_indexes()[0]
     return ScreenStatus(
         on=backend is not None,
-        # A sidebar/env path is not a name the model may echo back; say what
+        # A Settings/env path is not a name the model may echo back; say what
         # it is instead.
         against=(label if backend is None or label in named
-                 else "a path set in the sidebar"),
+                 else "a path set under Settings"),
         available=[str(named[n]) for n in usable_indexes()])
 
 
@@ -240,7 +255,7 @@ def cached_transcript(accession: str) -> str:
 def ollama_health(host: str, model: str) -> tuple[str, bool]:
     """(one line on the local model, whether it is usable). Two GETs, 1.5 s each.
 
-    The sidebar used to say "Model: ollama" whether or not the server was up,
+    The status used to say "Model: ollama" whether or not the server was up,
     the model pulled, or loaded; the first chat message then failed two minutes
     later. Cached for 30 s so a rerun does not ask again.
     """
@@ -274,6 +289,24 @@ def ollama_health(host: str, model: str) -> tuple[str, bool]:
 
 # --- helpers ---------------------------------------------------------------
 
+def try_design(fn, *args, **kwargs) -> tuple[object, str]:
+    """(result, "") or (None, "Headline. Why.") -- `run_design` without the
+    error box, for a batch that reports each row's failure on its own line."""
+    from mypibypy.design import FusionGeometryError
+    from mypibypy.loci import LociNotConfigured
+    from mypibypy.sequence import TranscriptFetchError
+    try:
+        return fn(*args, **kwargs), ""
+    except (ValueError, FusionGeometryError) as exc:
+        return None, f"No design could be produced. {exc}"
+    except TranscriptFetchError as exc:
+        return None, f"Could not fetch the transcript. {exc}"
+    except LociNotConfigured as exc:
+        return None, f"Configuration problem. {exc}"
+    except OSError as exc:
+        return None, f"Could not reach a reference service. {exc}"
+
+
 def run_design(fn, *args, **kwargs):
     """Call a design function and turn its failures into readable messages.
 
@@ -282,20 +315,11 @@ def run_design(fn, *args, **kwargs):
     proxy. None of those is a bug, and none should reach the user as a
     traceback.
     """
-    from mypibypy.design import FusionGeometryError
-    from mypibypy.loci import LociNotConfigured
-    from mypibypy.sequence import TranscriptFetchError
-    try:
-        return fn(*args, **kwargs)
-    except (ValueError, FusionGeometryError) as exc:
-        st.error(f"**No design could be produced.** {exc}")
-    except TranscriptFetchError as exc:
-        st.error(f"**Could not fetch the transcript.** {exc}")
-    except LociNotConfigured as exc:
-        st.error(f"**Configuration problem.** {exc}")
-    except OSError as exc:
-        st.error(f"**Could not reach a reference service.** {exc}")
-    return None
+    result, problem = try_design(fn, *args, **kwargs)
+    if problem:
+        headline, _, why = problem.partition(". ")
+        st.error(f"**{headline}.** {why}")
+    return result
 
 
 def session() -> DesignSession:
@@ -317,54 +341,63 @@ def session() -> DesignSession:
 ENV_SEED = "MYPIBYPY_UI_SEED"
 
 
+def registered_targets() -> dict:
+    """Every target in the loci file, keyed by the MCP server's ids."""
+    from mypibypy.mcp_server import load_targets
+    return load_targets()[0]
+
+
 def seed_session(s: DesignSession) -> None:
     """Design each `$MYPIBYPY_UI_SEED` target into `s`, as the form would."""
     seeds = [x.strip() for x in os.environ.get(ENV_SEED, "").split(",") if x.strip()]
     if not seeds:
         return
-    from mypibypy.mcp_server import load_targets   # the MCP server's ids
-    targets, _ = load_targets()
+    targets = registered_targets()
     for seed in seeds:
         target_id, _, screen = seed.partition("@")
-        target = targets.get(target_id)
-        if target is None:
+        if target_id not in targets:
             st.warning(f"`{ENV_SEED}`: no target `{target_id}`. Known: "
                        + (", ".join(f"`{t}`" for t in sorted(targets)) or "none"))
-            continue
-        if screen not in (SCREEN_DEFAULT, SCREEN_OFF, *screen_indexes()[0]):
+        elif screen not in (SCREEN_DEFAULT, SCREEN_OFF, *screen_indexes()[0]):
             st.warning(f"`{ENV_SEED}`: no index `{screen}` for `{target_id}`.")
-            continue
-        backend, screened_against = screen_for(screen)
-        obj, params, form_target = target.obj, s.params, None
-        with st.spinner(f"Seeding {target_id}…"):
-            if target.kind == "fusion":
-                mode, label = "Fusion junction", f"fusion {obj.name}"
-                results = run_design(design_fusion, obj, backend=backend,
-                                     screen=backend is not None)
+        else:
+            design_registered(s, targets[target_id], screen)
+
+
+def design_registered(s: DesignSession, target, screen: str) -> bool:
+    """Design a loci-file target into `s` as the form would; False if it failed."""
+    backend, screened_against = screen_for(screen)
+    obj, params, form_target = target.obj, s.params, None
+    with st.spinner(f"Designing {target.id}…"):
+        if target.kind == "fusion":
+            mode, label = "Fusion junction", f"fusion {obj.name}"
+            results = run_design(design_fusion, obj, backend=backend,
+                                 screen=backend is not None)
+        else:
+            params = replace(params, system=obj.system)
+            kw = dict(backend=backend, screen=backend is not None,
+                      n_pairs=params.n_pairs, min_spacing=params.min_spacing)
+            if target.kind == "rna":
+                mode, label = "RNA transcript", obj.accession
+                form_target = target_from_form(mode, accession=obj.accession)
+                seq = run_design(cached_transcript, obj.accession)
+                one = seq and run_design(design_rna, obj, transcript_seq=seq, **kw)
             else:
-                params = replace(params, system=obj.system)
-                kw = dict(backend=backend, screen=backend is not None,
-                          n_pairs=params.n_pairs, min_spacing=params.min_spacing)
-                if target.kind == "rna":
-                    mode, label = "RNA transcript", obj.accession
-                    form_target = target_from_form(mode, accession=obj.accession)
-                    seq = run_design(cached_transcript, obj.accession)
-                    one = seq and run_design(design_rna, obj, transcript_seq=seq, **kw)
-                else:
-                    iv = obj.interval
-                    mode = "Genomic region"
-                    label = f"{iv.build} {iv.chrom}:{iv.start:,}-{iv.end:,}"
-                    form_target = target_from_form(mode, build=iv.build,
-                                                   chrom=iv.chrom, start=iv.start,
-                                                   end=iv.end)
-                    one = run_design(design_locus, obj, **kw)
-                results = [one] if one else None
-        if not results:
-            continue
-        s.update(params=params, target=form_target)
-        s.screen = screen
-        s.record(source="seed", results=results, note=f"mypibypy UI: {target_id}.",
-                 target_label=label, mode=mode, screen=screened_against)
+                iv = obj.interval
+                mode = "Genomic region"
+                label = f"{iv.build} {iv.chrom}:{iv.start:,}-{iv.end:,}"
+                form_target = target_from_form(mode, build=iv.build,
+                                               chrom=iv.chrom, start=iv.start,
+                                               end=iv.end)
+                one = run_design(design_locus, obj, **kw)
+            results = [one] if one else None
+    if not results:
+        return False
+    s.update(params=params, target=form_target)
+    s.screen = screen
+    s.record(source="seed", results=results, note=f"mypibypy UI: {target.id}.",
+             target_label=label, mode=mode, screen=screened_against)
+    return True
 
 
 def windows_for(run, i: int) -> list:
@@ -481,7 +514,7 @@ def chat_editor(s: DesignSession, client_kind: str,
     client = build_client(client_kind)
     if client is None:
         say("assistant", "No decision model is selected, so I cannot interpret "
-                         "that. Pick **ollama** under *Settings* in the sidebar, "
+                         "that. Pick **ollama** under *Settings* (top right), "
                          "or use the Form.")
         return
 
@@ -733,7 +766,7 @@ def form_editor(s: DesignSession, system_keys: list[str],
         format_func=screen_label, key=f"f_screen_{rev}",
         help="The bowtie v1 index each pair is screened against for "
              "off-targets. Name indexes in indexes.local.json; Default uses "
-             "the path under Settings in the sidebar.")
+             "the path under Settings (top right).")
     backend, screened_against = screen_for(screen_choice)
 
     with st.expander("Advanced"):
@@ -928,6 +961,164 @@ def form_editor(s: DesignSession, system_keys: list[str],
              mode=mode, agent=agent_run, screen=screened_against)
 
 
+# --- batch editor ----------------------------------------------------------
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def batch_template(system_keys: tuple[str, ...]) -> bytes:
+    """The empty template. It holds no sequence, so keeping it is harmless."""
+    return template_bytes(list(system_keys))
+
+
+#: Which of the batch's screen choices each kind of row is screened with.
+#: Pasted sequences get their own: they may be DNA or RNA, and the Form gives
+#: them one choice too.
+BATCH_SCREEN = {"genomic": "genome", "fusion": "genome", "rna": "transcriptome",
+                "sequence": "sequence"}
+
+
+def batch_screen(label: str, default: str, wanted: str | None, key: str) -> str:
+    """A *Screen against* choice for one kind of row, warning on a mismatch.
+    `wanted` is None for pasted sequences, which either kind of index fits."""
+    options = [SCREEN_DEFAULT, *usable_indexes(), SCREEN_OFF]
+    choice = st.selectbox(label, options,
+                          index=options.index(default) if default in options else 0,
+                          format_func=screen_label, key=key)
+    chosen = screen_indexes()[0].get(choice)
+    mismatch = kind_mismatch(chosen, wanted) if chosen and wanted else None
+    if mismatch:
+        st.warning(mismatch)
+    return choice
+
+
+def design_batch_row(row, params: DesignParameters, backend) -> tuple[list, str]:
+    """(results, why not) for one uploaded row, without an error box: one bad
+    row is reported on its own line instead of burying the rest."""
+    kw = dict(backend=backend, screen=backend is not None)
+    if row.kind == "fusion":
+        both, problem = try_design(design_fusion, row.target, **kw)
+        return list(both or []), problem
+    kw |= dict(n_pairs=params.n_pairs, min_spacing=params.min_spacing)
+    if row.kind == "rna":
+        seq, problem = try_design(cached_transcript, row.target.accession)
+        if seq is None:
+            return [], problem
+        one, problem = try_design(design_rna, row.target, transcript_seq=seq, **kw)
+    elif row.kind == "sequence":
+        one, problem = try_design(design_rna, row.target,
+                                  transcript_seq=row.sequence, **kw)
+    else:
+        one, problem = try_design(design_locus, row.target, **kw)
+    return ([one] if one is not None else []), problem
+
+
+def batch_editor(s: DesignSession, system_keys: list[str]) -> None:
+    """Design every target in an uploaded template as one run, one order.
+
+    The pair count, spacing and screens apply to the whole upload, as the
+    CLI's `--pairs` does to a loci file. Genomic regions and fusions are
+    screened against a genome, transcripts against a transcriptome, and pasted
+    sequences against whichever the user picks, so each gets its own choice.
+    """
+    st.markdown("Design several targets at once: one row per target in the "
+                "template, then upload it.")
+    st.download_button(
+        "Download the template", icon=":material/download:",
+        data=batch_template(tuple(system_keys)), file_name=TEMPLATE_FILENAME,
+        mime=XLSX, key="batch_template",
+        help="Sheets for genomic regions, RNA transcripts and fusion "
+             "junctions, with the same fields as the loci file, and one for "
+             "pasted sequences. The Instructions sheet says what each column "
+             "means.")
+    upload = st.file_uploader("Filled-in template", type="xlsx",
+                              key="batch_upload", max_upload_size=2)
+    if upload is None:
+        st.caption(f"Up to {MAX_TARGETS} targets per upload.")
+        return
+    try:
+        rows = read_batch(upload.getvalue(), system_keys)
+    except BatchSheetError as exc:
+        st.error(str(exc), title="Could not read this file")
+        return
+
+    ready = [r for r in rows if r.ok]
+    # The reasons go in the warning, not a column: in this half-width editor a
+    # sentence in a cell is cut to its first few words.
+    st.dataframe([{"Ready": r.ok, "Target": r.label, "Channel": r.system or "—",
+                   "Row": r.where} for r in rows],
+                 hide_index=True, alt="The targets read from the upload")
+    if len(ready) < len(rows):
+        st.warning("\n".join(f"- **{r.where}**: {r.problem}" for r in rows
+                             if not r.ok)
+                   + "\n\nFix them in the file and upload it again, or design "
+                     "the rest without them.",
+                   title=f"{len(rows) - len(ready)} of {len(rows)} rows cannot "
+                         "be designed")
+    if not ready:
+        return
+
+    c1, c2 = st.columns(2)
+    n_pairs = c1.number_input(
+        "Pairs to tile", 1, 50, int(s.params.n_pairs), key="b_pairs",
+        help="Per genomic region or transcript. A fusion junction always "
+             "gets one pair per strand.")
+    min_spacing = c2.number_input(
+        "Minimum spacing (nt)", 0, 5000, int(s.params.min_spacing),
+        key="b_spacing", help="Gap kept between neighbouring pairs.")
+    kinds = {r.kind for r in ready}
+    screens = {}
+    if kinds & {"genomic", "fusion"}:
+        screens["genome"] = batch_screen(
+            "Screen genomic regions and fusions against", s.screen, "genome",
+            "b_screen_genome")
+    if "rna" in kinds:
+        transcriptomes = [n for n in usable_indexes()
+                          if screen_indexes()[0][n].kind == "transcriptome"]
+        screens["transcriptome"] = batch_screen(
+            "Screen RNA transcripts against",
+            transcriptomes[0] if transcriptomes else s.screen, "transcriptome",
+            "b_screen_transcriptome")
+    if "sequence" in kinds:
+        screens["sequence"] = batch_screen(
+            "Screen pasted sequences against", s.screen, None, "b_screen_sequence")
+    if not st.button(f"Design {len(ready)} target{'s' if len(ready) != 1 else ''}",
+                     type="primary", key="b_design"):
+        return
+
+    params = replace(s.params, n_pairs=int(n_pairs), min_spacing=int(min_spacing))
+    resolved = {kind: screen_for(choice) for kind, choice in screens.items()}
+    results, lines, done = [], [], 0
+    progress = st.progress(0.0)
+    for row in rows:
+        if not row.ok:
+            lines.append(BatchLine(row.where, row.label, row.system, (),
+                                   problem=row.problem))
+            continue
+        progress.progress(done / len(ready), text=f"Designing {row.label} "
+                          f"({done + 1} of {len(ready)})…")
+        done += 1
+        backend, against = resolved[BATCH_SCREEN[row.kind]]
+        designed, problem = design_batch_row(row, params, backend)
+        lines.append(BatchLine(
+            row.where, row.label, row.system,
+            tuple(range(len(results), len(results) + len(designed))),
+            requested=2 if row.kind == "fusion" else params.n_pairs,
+            screen=against, problem=problem))
+        results.extend(designed)
+    progress.empty()
+    if not results:
+        st.error("\n".join(f"- **{line.where}**: {line.problem}" for line in lines),
+                 title="None of the targets could be designed")
+        return
+    s.update(params=params)
+    count = f"{len(ready)} target{'s' if len(ready) != 1 else ''}"
+    s.record(source="batch", results=results,
+             note=f"mypibypy UI: batch upload {upload.name}, {count}.",
+             target_label=f"{upload.name}, {count}", mode=BATCH_MODE,
+             screen=" / ".join(dict.fromkeys(against for _, against
+                                             in resolved.values())),
+             batch=lines)
+
+
 # --- design panel ----------------------------------------------------------
 
 def _param_text(name: str, value) -> str:
@@ -996,8 +1187,14 @@ def _selected_pair(key: str, n_pairs: int) -> int:
     return picked if 1 <= picked <= n_pairs else 1
 
 
-def render_result(run, i: int, result, previous_run) -> None:
-    """One result of a run: map, compact table, close-up, details."""
+def render_result(run, i: int, result, previous_run,
+                  screen: str | None = None) -> None:
+    """One result of a run: map, compact table, close-up, details.
+
+    `screen` overrides the run's for a batch, whose rows were screened against
+    a genome or a transcriptome by kind.
+    """
+    screen = run.screen if screen is None else screen
     data = map_data(result, windows_for(run, i))
     prev_data = None
     if previous_run is not None and i < len(previous_run.results):
@@ -1023,9 +1220,9 @@ def render_result(run, i: int, result, previous_run) -> None:
     if n_unscreened:
         st.warning(f"**No specificity screen** for {n_unscreened} of "
                    f"{result.n_pairs} pair(s) — nothing here establishes "
-                   f"single-copy status. {no_screen_hint(run.screen, result)}")
-    elif run.screen and run.screen != "off":
-        st.caption(f"Screened against **{run.screen}**.")
+                   f"single-copy status. {no_screen_hint(screen, result)}")
+    elif screen and screen != "off":
+        st.caption(f"Screened against **{screen}**.")
 
     rows = candidate_rows(result)
     st.dataframe([{k: row[k] for k in KEY_COLUMNS} for row in rows],
@@ -1070,6 +1267,11 @@ def design_panel(s: DesignSession) -> None:
         s.select(chosen)
         run = s.current
 
+    if run.mode == BATCH_MODE:
+        show_batch(run)
+        download_order(run)
+        return
+
     previous = s.previous(run)
     st.markdown(_summary_line(run.params, previous.params if previous else None,
                               run.target_label))
@@ -1085,8 +1287,10 @@ def design_panel(s: DesignSession) -> None:
     unscreened = sum(unscreened_pairs(r) for r in results)
     m1, m2, m3 = st.columns(3)
     m1.metric("Pairs designed", total)
-    m2.metric("Specificity screen", "not run" if unscreened == total
-              else f"{total - unscreened}/{total} screened")
+    # Short values: a metric tile is a third of the panel, and "1/1 screened"
+    # was cut to "1/1 s…" on a laptop screen.
+    m2.metric("Pairs screened", "none" if unscreened == total
+              else f"{total - unscreened} of {total}")
     m3.metric("Channel", results[0].system.fluorophore)
     requested = run.params.n_pairs * len(results)
     if run.mode != "Fusion junction" and total < requested:
@@ -1106,84 +1310,208 @@ def design_panel(s: DesignSession) -> None:
                 render_result(run, i, result, previous)
     else:
         render_result(run, 0, results[0], previous)
+    download_order(run)
 
+
+def download_order(run) -> None:
     st.download_button(
         "Download order workbook (.xlsx)", icon=":material/download:",
-        data=workbook_bytes(results, run.note),
+        data=workbook_bytes(run.results, run.note),
         file_name=f"mypibypy_order_run{run.number}.xlsx", mime=XLSX,
         type="primary", key=f"download_{run.number}",
         help="Probe sequences are in the workbook. They are not written "
              "anywhere inside the repository.")
 
 
-# --- sidebar: status, then settings you set once ---------------------------
+def _batch_status(run, line) -> tuple[str, str]:
+    """(pairs, screen) cells of one batch line."""
+    if not line.results:
+        return "—", "—"
+    mine = [run.results[i] for i in line.results]
+    placed = sum(r.n_pairs for r in mine)
+    unscreened = sum(unscreened_pairs(r) for r in mine)
+    screen = ("NOT SCREENED" if unscreened == placed
+              else f"{placed - unscreened} of {placed} screened" if unscreened
+              else line.screen)
+    return f"{placed} of {line.requested}", screen
+
+
+def show_batch(run) -> None:
+    """A batch run: what became of every uploaded row, then one target in full.
+
+    One target at a time rather than a tab each: every tab's body is drawn on
+    every rerun, and fifty probe maps made each click slow.
+    """
+    results = run.results
+    st.markdown(f"Pairs **{run.params.n_pairs}** per target · Spacing "
+                f"**{run.params.min_spacing} nt** · Upload `{run.target_label}`")
+    designed = [line for line in run.batch if line.results]
+    total = sum(r.n_pairs for r in results)
+    unscreened = sum(unscreened_pairs(r) for r in results)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Targets designed", f"{len(designed)} of {len(run.batch)}")
+    m2.metric("Pairs designed", total)
+    m3.metric("Pairs screened", "none" if unscreened == total
+              else f"{total - unscreened} of {total}")
+
+    # Short columns first: the panel is about half the page, and the grid
+    # cuts whatever does not fit. Why a row failed is a sentence, so it goes
+    # in the warning below rather than in a cell.
+    table = []
+    for line in run.batch:
+        pairs, screen = _batch_status(run, line)
+        table.append({"Target": line.label, "Pairs": pairs, "Screen": screen,
+                      "Channel": line.system or "—", "Row": line.where})
+    st.dataframe(table, hide_index=True,
+                 alt="Every uploaded row: pairs placed, screen, channel and row")
+    failed = [line for line in run.batch if not line.results]
+    if failed:
+        st.warning("\n".join(f"- **{line.where}**: {line.problem}"
+                             for line in failed)
+                   + "\n\nThey are not in the workbook. Fix them in the file "
+                     "and upload it again.",
+                   title=f"{len(failed)} of {len(run.batch)} rows not designed")
+    short = [line.where for line in designed
+             if sum(results[i].n_pairs for i in line.results) < line.requested]
+    if short:
+        st.caption(f":material/warning: Fewer pairs than requested at "
+                   f"{', '.join(short)}: the tiler found no more non-overlapping "
+                   "windows at this spacing among the ones it ranked.")
+
+    shown = [(line, i) for line in designed for i in line.results]
+    pick = st.selectbox(
+        "Show target", range(len(shown)), key=f"batch_show_{run.number}",
+        format_func=lambda k: (f"{results[shown[k][1]].locus.gene} "
+                               f"{results[shown[k][1]].locus.name} · "
+                               f"{shown[k][0].where}"))
+    line, i = shown[pick]
+    render_result(run, i, results[i], None, screen=line.screen)
+
+
+# --- header: status, then settings you set once -----------------------------
+# Drawn above every page, not in a sidebar: the status is three short badges
+# and the settings are set once, so neither earns a column of its own. Settings
+# are on every page so their widgets keep their values when the page changes.
 
 reg = registry()
 
-with st.sidebar:
-    _icon_col, _title_col = st.columns([1, 3], vertical_alignment="center")
-    _icon_col.image(str(ICON_PATH))
-    _title_col.title("mypibypy")
-    st.caption("piFISH split-probe design")
-    status = st.container()
-    with st.expander("Settings"):
-        index_path = st.text_input(
-            "bowtie index (optional)", key="index_path",
-            placeholder=os.environ.get(ENV_BOWTIE_INDEX, "") or None,
-            help="A bowtie v1 index basename, used when a design's *Screen "
-                 "against* is Default. Leave blank to fall back to "
-                 f"${ENV_BOWTIE_INDEX}, or to no screen. Named indexes go in "
-                 "indexes.local.json and are picked in the Form or the chat.")
-        _named, _index_error = screen_indexes()
-        if _index_error:
-            st.error(f"Indexes file not loaded: {_index_error}")
-        for _idx in _named.values():
-            if _idx.problem:
-                st.warning(f"Index **{_idx.name}** unusable: {_idx.problem}")
-        client_kind = st.selectbox(
-            "Decision model", ["ollama", "none", "anthropic"], index=0,
-            key="client_kind",
-            help="Local model by default. 'none' runs the pipeline with no "
-                 "model at all; the chat then cannot read requests.")
-        # `loaded_from()` reports only what is currently cached, and Streamlit
-        # can re-import the module on a hot reload while `registry()` stays
-        # cached -- which showed "systems: None" even though the real file was
-        # loaded. Resolve the path directly so the caption always names the
-        # file that would be used.
-        st.caption(f"Amplifier systems file: `{resolve_systems_path()}`")
+st.logo(str(ICON_PATH), size="large")
+_header = st.container(horizontal=True, vertical_alignment="center")
+status = _header.container(horizontal=True, gap="small")
+with _header.popover("Settings", icon=":material/settings:"):
+    index_path = st.text_input(
+        "bowtie index (optional)", key="index_path",
+        placeholder=os.environ.get(ENV_BOWTIE_INDEX, "") or None,
+        help="A bowtie v1 index basename, used when a design's *Screen "
+             "against* is Default. Leave blank to fall back to "
+             f"${ENV_BOWTIE_INDEX}, or to no screen. Named indexes go in "
+             "indexes.local.json and are picked in the Form or the chat.")
+    _named, _index_error = screen_indexes()
+    if _index_error:
+        st.error(f"Indexes file not loaded: {_index_error}")
+    for _idx in _named.values():
+        if _idx.problem:
+            st.warning(f"Index **{_idx.name}** unusable: {_idx.problem}")
+    client_kind = st.selectbox(
+        "Decision model", ["ollama", "none", "anthropic"], index=0,
+        key="client_kind",
+        help="Local model by default. 'none' runs the pipeline with no "
+             "model at all; the chat then cannot read requests.")
+    # `loaded_from()` reports only what is currently cached, and Streamlit
+    # can re-import the module on a hot reload while `registry()` stays
+    # cached -- which showed "systems: None" even though the real file was
+    # loaded. Resolve the path directly so the caption always names the
+    # file that would be used.
+    st.caption(f"Amplifier systems file: `{resolve_systems_path()}`")
 
 
-
-def model_line() -> str:
-    """The sidebar's model line: what is actually there, not just what is selected."""
+def model_badge() -> None:
+    """The model badge: what is actually there, not just what is selected."""
     if client_kind == "none":
-        return ":material/block: Model: none — chat disabled"
+        st.badge("Model: none — chat disabled", icon=":material/block:", color="gray")
+        return
     if client_kind != "ollama":
-        return f":material/smart_toy: Model: {client_kind}"
+        st.badge(f"Model: {client_kind}", icon=":material/smart_toy:", color="blue")
+        return
     probe = OllamaDecisionClient()          # host and model from the environment; no call
     text, ok = ollama_health(probe.host, probe.model)
-    return f"{':material/smart_toy:' if ok else ':material/warning:'} Model: {text}"
+    st.badge(f"Model: {text}", icon=":material/smart_toy:" if ok else ":material/warning:",
+             color="green" if ok else "orange")
 
 
-def sidebar_status() -> None:
+def header_status() -> None:
     """Drawn after the page, so a screen the chat just switched on shows now."""
     backend, against = screen_for(session().screen)
     with status:
-        st.markdown(
-            (":material/science: **Systems: synthetic examples** — not orderable"
-             if is_example() else ":material/check_circle: Systems: real") + "  \n"
-            + (":material/warning: **Specificity screen: off** — pick an index in "
-               "the Form" if screen_is_off(against) else
-               f":material/warning: **Specificity screen: {against}**"
-               if backend is None
-               else f":material/check_circle: Specificity screen: {against}")
-            + "  \n"
-            + model_line())
+        if is_example():
+            st.badge("Systems: synthetic examples — not orderable",
+                     icon=":material/science:", color="red")
+        else:
+            st.badge("Systems: real", icon=":material/check_circle:", color="green")
+        if screen_is_off(against):
+            st.badge("Specificity screen: off", icon=":material/warning:",
+                     color="orange", help="Pick an index in the Form.")
+        elif backend is None:
+            st.badge(f"Specificity screen: {against}", icon=":material/warning:",
+                     color="orange")
+        else:
+            st.badge(f"Specificity screen: {against}",
+                     icon=":material/check_circle:", color="green")
+        model_badge()
 
 
 # --- pages -------------------------------------------------------------------
 
-def workspace() -> None:
+#: The package README, linked from Home. CITATION.cff names the same repository.
+README_URL = "https://github.com/sstaller-sj/mypibypy/blob/main/mypibypy/README.md"
+#: Pairs the tutorial fills in: enough to show tiling on its 500-nt region.
+TUTORIAL_PAIRS = 6
+
+
+def show_home() -> None:
+    """Where the app opens: what it does, and the ways in."""
+    page = st.container(horizontal_alignment="center")
+    with page.container(width=640, horizontal_alignment="center"):
+        st.image(str(ICON_PATH), width=96)
+        st.title("mypibypy", text_alignment="center")
+        st.markdown("Design piFISH split-probe primaries (P1L/P1R) for a "
+                    "genomic region, a transcript or a fusion junction, "
+                    "screen them for off-targets, and download the order "
+                    "workbook.", text_alignment="center")
+        if st.button("Open the workspace", icon=":material/arrow_forward:",
+                     type="primary", key="open_workspace"):
+            st.switch_page(workspace_page)
+        with st.container(horizontal=True, horizontal_alignment="center"):
+            st.page_link(tutorial_page, label="Tutorial: your first design",
+                         icon=":material/school:")
+            st.page_link(help_page, label="Help", icon=":material/help:")
+            st.page_link(README_URL, label="README", icon=":material/description:")
+
+
+def example_locus() -> Locus:
+    """The tutorial's target: the first locus of the shipped example file."""
+    from mypibypy import loci
+    return loci.load_loci(Path(loci.__file__).parent / loci.EXAMPLE_FILENAME)[0]
+
+
+def show_tutorial() -> None:
+    locus = example_locus()
+    with st.container(width=800):           # prose reads badly at full width
+        clicked = render_tutorial(locus, TUTORIAL_PAIRS)
+    if clicked:
+        s = session()
+        iv = locus.interval
+        params = replace(s.params, n_pairs=TUTORIAL_PAIRS)
+        if locus.system in registry():
+            params = replace(params, system=locus.system)
+        s.update(params=params,
+                 target=target_from_form("Genomic region", build=iv.build,
+                                         chrom=iv.chrom, start=iv.start, end=iv.end))
+        st.session_state["open_editor"] = "Form"
+        st.switch_page(workspace_page)
+
+
+def show_workspace() -> None:
     s = session()
     if is_example():
         st.error(f"Amplifier systems are the SYNTHETIC EXAMPLES "
@@ -1191,10 +1519,18 @@ def workspace() -> None:
                  "**not orderable** — see *Help*.")
     left, right = st.columns([5, 6], gap="large")
     with left:
-        editor = st.segmented_control("Editor", ["Chat", "Form"], default="Chat",
-                                      key="editor", label_visibility="collapsed")
+        if "open_editor" in st.session_state:     # the tutorial asked for the Form
+            st.session_state["editor"] = st.session_state.pop("open_editor")
+        # No default once Session State holds a value: Streamlit warns when both
+        # set a widget.
+        editor = st.segmented_control(
+            "Editor", ["Chat", "Form", "Batch"], key="editor",
+            label_visibility="collapsed",
+            default=None if "editor" in st.session_state else "Chat")
         if editor == "Form":
             form_editor(s, sorted(reg), False, client_kind)
+        elif editor == "Batch":
+            batch_editor(s, sorted(reg))
         else:
             chat_editor(s, client_kind, sorted(reg))
     # Drawn after the editor, so it already reflects whatever the editor did.
@@ -1202,14 +1538,18 @@ def workspace() -> None:
         design_panel(s)
 
 
-def help_page() -> None:
+def show_help() -> None:
     render_help(systems_path=resolve_systems_path(), example=is_example(),
                 screen_on=screen_for(session().screen)[0] is not None,
                 client_kind=client_kind)
 
 
-st.navigation([st.Page(workspace, title="Workspace", icon=":material/biotech:",
-                       default=True),
-               st.Page(help_page, title="Help", icon=":material/help:")],
+workspace_page = st.Page(show_workspace, title="Workspace",
+                         icon=":material/biotech:", url_path="workspace")
+tutorial_page = st.Page(show_tutorial, title="Tutorial", icon=":material/school:",
+                        url_path="tutorial")
+help_page = st.Page(show_help, title="Help", icon=":material/help:", url_path="help")
+st.navigation([st.Page(show_home, title="Home", icon=":material/home:", default=True),
+               workspace_page, tutorial_page, help_page],
               position="top").run()
-sidebar_status()
+header_status()

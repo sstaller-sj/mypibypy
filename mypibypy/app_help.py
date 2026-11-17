@@ -1,4 +1,5 @@
-"""The Help page: how the pipeline works, what the numbers mean, setup status.
+"""The Help and Tutorial pages: how the pipeline works, what the numbers mean,
+setup status, and one worked example.
 
 These explanations used to sit as captions under every result. They are true
 and worth reading once, but repeated on every card they buried the result; the
@@ -29,7 +30,7 @@ def render_help(*, systems_path: Path, example: bool, screen_on: bool,
            "off. Name your bowtie v1 indexes in `indexes.local.json` (copy "
            "`src/mypibypy/indexes.example.json`) and pick one under *Screen "
            "against* in the Form or by asking the chat (*screen against "
-           "hg38*); or enter a path under *Settings* in the sidebar. Until "
+           "hg38*); or enter a path under *Settings* (top right). Until "
            "then every pair says NOT SCREENED and nothing establishes "
            "single-copy status.")
         + f"\n- {':material/block:' if client_kind == 'none' else ':material/smart_toy:'} "
@@ -43,6 +44,15 @@ def render_help(*, systems_path: Path, example: bool, screen_on: bool,
         "- **Chat** and **Form** edit the same design. Change the pair count in "
         "the chat and the form opens on the new value; design from the form "
         "and the chat can keep adjusting that target.\n"
+        "- **Batch** designs several targets at once. Download the template, "
+        "fill in one row per target on the sheet for its type (genomic "
+        "region, RNA transcript, fusion junction or pasted sequence), and "
+        "upload it. The pair count, spacing and screens apply to the whole "
+        "upload; genomic regions and fusions get a genome screen, transcripts "
+        "a transcriptome one, and pasted sequences whichever you pick. A row "
+        "that cannot be designed is listed with the reason and left out of "
+        "the order, and the rest go ahead. An Excel cell holds at most "
+        "32,767 characters, so paste a longer sequence into the Form.\n"
         "- **Current design** shows the selected run. Every design is kept — "
         "pick an earlier one from the run menu to compare or download it.\n"
         "- The **target is never the model's**: regions, accessions and pasted "
@@ -108,3 +118,68 @@ def render_help(*, systems_path: Path, example: bool, screen_on: bool,
         "not known to the screen.\n"
         "- **Fusion junction**: one position — the gap sits on the breakpoint — "
         "so tiling does not apply. Both strands are designed.")
+
+
+def render_tutorial(locus, n_pairs: int) -> bool:
+    """One design from start to order, on the shipped example locus.
+
+    Returns True when the user asks for the Form to be filled in with it.
+    """
+    iv = locus.interval
+    region = f"{iv.chrom}:{iv.start}-{iv.end}"
+    st.title("Tutorial: your first design")
+    st.markdown(
+        f"A worked example on the mouse *{locus.gene}* {locus.name} — "
+        f"`{iv.build} {region}`, channel `{locus.system}`. *Actb* is a "
+        "standard positive control: Tao et al., *Nat Commun* 14:443 (2023) "
+        "imaged it with 35 pi target probes. The region is the first entry of "
+        "`loci.example.json`.")
+    clicked = st.button("Fill in the Form with this example", type="primary",
+                        icon=":material/edit_note:", key="tutorial_fill")
+
+    st.subheader("1. Fill in the Form")
+    st.markdown(
+        f"The button above opens the Workspace on the **Form** with the region, "
+        f"the `{locus.system}` system and {n_pairs} pairs filled in. To type it "
+        f"yourself: *Target type* **Genomic region**, *Genome build* "
+        f"`{iv.build}`, *Region* `{region}`. Under *Labels (optional)*, enter "
+        f"`{locus.gene}` and `{locus.name}` so the oligos are named for it.")
+
+    st.subheader("2. Choose the specificity screen")
+    st.markdown(
+        "*Screen against* is the bowtie index every pair is checked against "
+        f"for off-targets. For a mouse locus that should be a mouse genome "
+        f"({iv.build}) index. With none, the design still runs, but every pair "
+        "says **NOT SCREENED** and nothing establishes single-copy status: "
+        "fine for learning the tool, not for an order.")
+
+    st.subheader("3. Press Design probes")
+    st.markdown(
+        "The sequence is fetched and repeat-masked, every 51-nt window is "
+        "scored, and the best non-overlapping ones are tiled into pairs — a "
+        "few seconds, longer the first time a region is fetched.")
+
+    st.subheader("4. Read the result")
+    st.markdown(
+        "- **The numbers at the top**: pairs placed, how many were screened, "
+        "and the channel. A note says so when fewer pairs fit than you asked "
+        "for.\n"
+        "- **The probe map**: the ordered pairs along the region, the "
+        "best-scoring windows, and the penalty along the target. Click a pair "
+        "for its close-up.\n"
+        "- **The table**: each pair's footprint, the Tm of each half, the "
+        "screen's verdict, the worst off-target P(bound) and self-folding.\n\n"
+        "*Help* explains every track and number.")
+
+    st.subheader("5. Adjust it in the chat")
+    st.markdown(
+        "Switch to **Chat** and ask *make it 8 pairs* or *why did I get fewer "
+        "than I asked for?*. The chat changes the same design; every design is "
+        "kept in the run menu above the result, so you can compare them.")
+
+    st.subheader("6. Download the order")
+    st.markdown(
+        "**Download order workbook (.xlsx)** holds the P1L/P1R sequences, "
+        "named from the Form's labels (`GENE` and `target` if you left them). "
+        "They are not written anywhere inside the repository.")
+    return clicked
