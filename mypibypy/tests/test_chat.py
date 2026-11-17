@@ -39,7 +39,7 @@ KEYS = ("cy5", "cy3")
 def payload(**over):
     base = {"intent": "change", "system": UNCHANGED, "n_pairs": UNCHANGED_INT,
             "min_spacing": UNCHANGED_INT, "enforce_window": UNCHANGED,
-            "screen": UNCHANGED, "note": "ok"}
+            "screen": UNCHANGED, "topic": "none", "note": "ok"}
     base.update(over)
     return base
 
@@ -167,12 +167,46 @@ class TestIntentValidation:
                                                              "unclear"]
         assert "relax" not in schema
         assert set(schema) == {"intent", "system", "n_pairs", "min_spacing",
-                               "enforce_window", "screen", "note"}
+                               "enforce_window", "screen", "topic", "note"}
+
+    def test_the_topic_is_a_closed_list_too(self):
+        """A question comes back as one of a fixed set of topics, and the
+        software writes the answer. A topic outside the list is refused like
+        any other value outside the schema."""
+        from mypibypy.agent.topics import ALL_KEYS
+
+        assert intent_schema(KEYS)["properties"]["topic"]["enum"] == list(ALL_KEYS)
+        with pytest.raises(ParameterRefused, match="topic"):
+            Intent.from_payload(payload(intent="explain", topic="horoscope"), KEYS)
+
+    def test_a_topic_only_means_something_on_a_question(self):
+        change = Intent.from_payload(payload(intent="change", topic="placement"), KEYS)
+        assert change.topic == "none", "a change is not a question"
+        bare = Intent.from_payload(payload(intent="explain", topic="none"), KEYS)
+        assert bare.topic == "other", "a question with no topic is the model's to answer"
+        asked = Intent.from_payload(payload(intent="explain", topic="placement"), KEYS)
+        assert asked.topic == "placement"
 
 
 # --- Applying an intent ----------------------------------------------------
 
 class TestApplyIntent:
+    def test_a_question_carrying_a_number_changes_nothing(self):
+        """"Could I fit 10 pairs?" comes back as an explain with n_pairs=10, for
+        the preview. Asking is not asking for it to be done: the settings and
+        the screen stay where they are."""
+        from mypibypy.agent.intent import apply_screen
+
+        asked = Intent.from_payload(
+            payload(intent="explain", topic="what_if", n_pairs=10, min_spacing=5,
+                    system="cy3", enforce_window="on"), KEYS)
+        before = DesignParameters(system="cy5", n_pairs=4)
+        params, changes = apply_intent(asked, before, KEYS)
+        assert params == before and changes == []
+        screened = Intent.from_payload(
+            payload(intent="explain", topic="screen", screen="hg38"), KEYS, ("hg38",))
+        assert apply_screen(screened, "off") == ("off", None)
+
     def test_unchanged_sentinels_change_nothing(self):
         start = DesignParameters(system="cy5", n_pairs=4)
         params, changes = apply_intent(Intent.from_payload(payload(), KEYS),

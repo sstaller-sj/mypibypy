@@ -89,3 +89,23 @@ def test_form_target_labels_match_the_chats():
     assert str(target_from_form("Pasted sequence", sequence="A" * 60)) == \
         "pasted sequence (60 nt)"
     assert target_from_form("Fusion junction") is None
+
+
+def test_form_labels_ride_along_without_changing_the_target():
+    """A chat turn that designs a Form or seed target again must name its
+    oligos, and tell on-target hits from off-target ones, as the Form did --
+    not fall back to GENE / target. The labels are not part of what the target
+    is: the same region with and without them is the same target, and prints
+    the same, since the printed form is what the model is shown."""
+    plain = target_from_form("Genomic region", build="hg38", chrom="chr7",
+                             start=5530000, end=5531000)
+    named = target_from_form("Genomic region", build="hg38", chrom="chr7",
+                             start=5530000, end=5531000, gene="ACTB", name="up")
+    assert (named.gene, named.name) == ("ACTB", "up")
+    assert (plain.gene, plain.name) == ("", "")
+    assert named == plain and str(named) == str(plain)
+    assert "ACTB" not in str(named)
+    rna = target_from_form("RNA transcript", accession="NM_000546.6", gene="TP53")
+    assert rna.gene == "TP53"
+    assert target_from_form("Pasted sequence", sequence="A" * 60,
+                            gene="G", name="n").name == "n"

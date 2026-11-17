@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass, field, replace
 
 from .actions import DesignParameters, ParameterRefused, clamp
+from .topics import ALL_KEYS, NONE, OTHER, guide
 
 #: Sentinel values meaning "the user did not ask to change this".
 UNCHANGED_INT = -1
@@ -91,16 +92,24 @@ def intent_schema(system_keys: tuple[str, ...] = (),
                                 "against, 'off' to stop screening, or "
                                 "unchanged."),
             },
+            "topic": {
+                "type": "string", "enum": list(ALL_KEYS),
+                "description": ("For intent 'explain', which kind of question "
+                                "this is (see TOPICS); the software writes the "
+                                f"answer. '{NONE}' for any other intent."),
+            },
             "note": {
                 "type": "string",
                 "description": ("Your reply to the user. One sentence for a "
-                                "change; for intent 'explain', a short plain "
-                                "answer (a few sentences) to their question. "
-                                "Displayed as text; never interpreted by the code."),
+                                f"change. For 'explain' with topic '{OTHER}', "
+                                "a short plain answer (a few sentences); for "
+                                "any other topic, one short sentence, since "
+                                "the software writes the answer. Displayed as "
+                                "text; never interpreted by the code."),
             },
         },
         "required": ["intent", "system", "n_pairs", "min_spacing",
-                     "enforce_window", "screen", "note"],
+                     "enforce_window", "screen", "topic", "note"],
         "additionalProperties": False,
     }
 
@@ -115,6 +124,9 @@ class Intent:
     min_spacing: int = UNCHANGED_INT
     enforce_window: str = UNCHANGED
     screen: str = UNCHANGED
+    #: Which kind of question an 'explain' is (`agent.topics`); the software
+    #: answers every topic but "other" itself (`agent.answers`).
+    topic: str = NONE
     note: str = ""
 
     @property
@@ -136,7 +148,8 @@ class Intent:
                 f"intent carries unexpected keys {sorted(extra)}; the schema is "
                 f"closed, and a conversation is exactly where that matters")
         for field, values in (("intent", INTENTS),
-                              ("enforce_window", ("on", "off", UNCHANGED))):
+                              ("enforce_window", ("on", "off", UNCHANGED)),
+                              ("topic", ALL_KEYS)):
             if payload[field] not in values:
                 raise ParameterRefused(
                     f"{field}={payload[field]!r} is not one of {list(values)}")
@@ -153,10 +166,18 @@ class Intent:
             min_spacing = int(payload["min_spacing"])
         except (TypeError, ValueError) as exc:
             raise ParameterRefused("n_pairs and min_spacing must be integers") from exc
+        # A topic only means something on a question. A question with none is
+        # one the model answers itself; anything else carries none.
+        topic = payload["topic"]
+        if payload["intent"] != "explain":
+            topic = NONE
+        elif topic == NONE:
+            topic = OTHER
         return Intent(intent=payload["intent"], system=payload["system"],
                       n_pairs=n_pairs, min_spacing=min_spacing,
                       enforce_window=payload["enforce_window"],
-                      screen=payload["screen"], note=str(payload["note"]))
+                      screen=payload["screen"], topic=topic,
+                      note=str(payload["note"]))
 
 
 def apply_intent(intent: Intent, params: DesignParameters,
@@ -165,9 +186,15 @@ def apply_intent(intent: Intent, params: DesignParameters,
 
     Every number still goes through `clamp`, because a number from a chat message
     is no more trustworthy than one typed into a form -- less, if anything.
+
+    Only a "change" moves anything. A question may carry numbers too -- "could
+    I fit 10 pairs?" comes back as an explain with n_pairs=10, for the preview
+    -- and asking is not asking for it to be done.
     """
     changes: list[str] = []
     new = params
+    if intent.intent != "change":
+        return params, changes
 
     if intent.system != UNCHANGED and intent.system != params.system:
         new = replace(new, system=intent.system)
@@ -194,9 +221,10 @@ def apply_screen(intent: Intent, current: str) -> tuple[str, str | None]:
     """The session's screen choice after `intent`, and what changed (or None).
 
     Separate from `apply_intent` because the screen is not a design parameter
-    -- see `session.DesignSession.screen`.
+    -- see `session.DesignSession.screen`. Like it, only a "change" moves it.
     """
-    if intent.screen == UNCHANGED or intent.screen == current:
+    if (intent.intent != "change" or intent.screen == UNCHANGED
+            or intent.screen == current):
         return current, None
     return intent.screen, ("specificity screen off" if intent.screen == SCREEN_OFF
                            else f"specificity screen → {intent.screen}")
@@ -322,6 +350,13 @@ class ExtractedTarget:
     end: int = 0
     accession: str = ""
     sequence: str = field(default="", repr=False)   # kind == "sequence" only
+    #: The labels a Form, seed or tutorial design gave this target, so a chat
+    #: turn that designs it again names its oligos the same way and, for a
+    #: transcript, screens with the same on-target gene. Empty for a target
+    #: read out of a chat message, which has none. Never shown to the model:
+    #: `__str__` is what the prompt gets.
+    gene: str = field(default="", compare=False)
+    name: str = field(default="", compare=False)
 
     @property
     def found(self) -> bool:
@@ -393,21 +428,31 @@ them 20 nt apart", "screen against hg38" -- is intent "change", with only the \
 settings the user named filled in; the software designs (again) with them. Do \
 not ask for a target or a channel that CURRENT DESIGN already shows.
 
-To answer a question ("why did I only get 3?", "why is pair 3 worse than pair \
-2?", "what should I change?"), use intent "explain", leave every parameter at \
-its sentinel, and answer in a few plain sentences built from `facts`, \
+A question ("why did I only get 3?", "what is penalty?", "how do I order?", \
+"hello") is intent "explain". Set `topic` to the one entry of TOPICS below that \
+says what is being asked, and leave every parameter at its sentinel. The \
+software then writes the answer itself from the design, so `note` is one short \
+sentence and you do not work anything out. The one exception to the sentinels \
+is topic "what_if": put the number the user asks about in `n_pairs` or \
+`min_spacing` ("could I fit 10?" is n_pairs 10; "what if the spacing were 5?" \
+is min_spacing 5). That is still "explain": nothing is designed. Asking what \
+a number would give ("how many do I get if the spacing is 5?") is a question; \
+"make it 10 pairs" or "do 4 pairs" is a request, so it is "change".
+
+Only when no topic fits a question about this design, use topic "other" and \
+answer it yourself in `note`, in a few plain sentences built from `facts`, \
 `what_if`, `pair_comparison` and `windows`. Repeat their sentences and numbers \
-as written; do not work out a number, a reason or a comparison yourself. \
-`what_if` lists changes the software has already tried, with how many pairs \
-each placed: suggest from it, and the user can then ask for one. If what you \
-would need is not there, say you cannot see it. Your reply is checked: a \
-number not in CURRENT DESIGN, or a comparison the wrong way round, is not \
-shown. Greetings and chit-chat get a short friendly "explain" reply.
+as written; do not work out a number, a reason or a comparison yourself. If \
+what you would need is not there, say you cannot see it. That reply is \
+checked: a number not in CURRENT DESIGN, or a comparison the wrong way round, \
+is not shown.
 
 A RECENT CONVERSATION block may follow, holding the last few lines of the \
 chat. Use it to work out what a short or corrective message refers to ("no, I \
 meant for the specificity screen"), and answer the question they are actually \
-asking; do not repeat your previous answer.
+asking; do not repeat your previous answer. A short follow-up takes its topic \
+from what it continues: "and pair 3?" after a question about pair 2 is \
+"pair_detail".
 
 BACKGROUND ON THE PROGRAM
 - piFISH labels a locus with split primaries: a left probe (P1L) and a right \
@@ -436,4 +481,6 @@ leave `screen` unchanged and tell them to add one to indexes.local.json, or to \
 enter an index path in the sidebar under Settings > "bowtie index \
 (optional)". You never write a path. Pasting a sequence does not turn the \
 screen on.
-"""
+
+TOPICS (for intent "explain")
+""" + guide() + "\n"

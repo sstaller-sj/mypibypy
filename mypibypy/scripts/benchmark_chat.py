@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Is the chat harness working on this machine, and can this model do the job?
 
-Runs ten scripted chat turns -- a design request, a follow-up, questions about
+Runs 31 scripted chat turns -- a design request, a follow-up, questions about
 the result, a screen request, a request the chat cannot act on -- through the
 same path the Streamlit chat runs, against a synthetic sequence, and scores the
 intent fields the model returned. Each turn is timed, each explain reply goes

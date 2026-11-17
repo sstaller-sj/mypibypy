@@ -25,6 +25,7 @@ from ..pipeline import design_rna
 from ..probe_map import scored_windows
 from ..session import DesignSession
 from .actions import Action, DesignParameters, ParameterRefused
+from .answers import Asked, answer
 from .client import SAMPLING, OllamaDecisionClient
 from .context import ScreenStatus, build_chat_context
 from .intent import (
@@ -89,15 +90,56 @@ def turns(system_keys: tuple[str, ...]) -> list[Turn]:
              {"intent": "change", "n_pairs": 12, "min_spacing": 20}, apply=False),
         Turn("hello", {"intent": {"explain", "unclear"}}),
         Turn("make it 6 pairs", {"intent": "change", "n_pairs": 6}),
-        Turn("why did I only get {placed}?", {"intent": "explain"}),
-        Turn("why is pair 2 worse than pair 1?", {"intent": "explain"}),
+        Turn("why did I only get {placed}?", {"intent": "explain",
+                                              "topic": "placement"}),
+        Turn("why is pair 2 worse than pair 1?", {"intent": "explain",
+                                                  "topic": "compare_pairs"}),
         Turn("screen against hg38", {"intent": "change", "screen": "hg38"}),
         # Not a setting the chat can change: anything but an invented change.
         Turn("too few passed, loosen the Tm",
              {"intent": {"change", "explain", "unclear"}, "n_pairs": UNCHANGED_INT,
               "min_spacing": UNCHANGED_INT, "system": UNCHANGED}),
         Turn("enforce the GC/Tm window", {"intent": "change", "enforce_window": "on"}),
-        Turn("what's the Tm of pair 2?", {"intent": "explain"}),
+        Turn("what's the Tm of pair 2?", {"intent": "explain",
+                                          "topic": "pair_detail"}),
+        *question_turns(),
+    ]
+
+
+def question_turns() -> list[Turn]:
+    """One question per topic, each answered by the software if the model
+    picks the topic. Worded differently from the examples in the model's guide
+    (`topics.TOPICS`), so a pass is the model reading the question, not
+    matching a string it was shown."""
+    def q(message: str, topic: str, **fields) -> Turn:
+        return Turn(message, {"intent": "explain", "topic": topic, **fields})
+
+    return [
+        # A follow-up with no subject of its own: it continues the last turn.
+        q("and pair 3?", "pair_detail"),
+        q("which one is the worst pair?", "best_worst"),
+        # A question that carries a number is still a question: nothing is
+        # designed, and the number is what the preview is run with.
+        q("would 10 pairs fit?", "what_if", n_pairs=10),
+        q("what happens with 10 nt spacing?", "what_if", min_spacing=10),
+        q("what's the maximum number of pairs for this target?", "capacity"),
+        q("what should I change to place more?", "get_more"),
+        q("were these checked for off-targets?", "screen"),
+        q("should I worry about the folded probe?", "folding"),
+        q("how accessible are the binding sites?", "accessibility"),
+        q("what do the QC flags mean?", "qc_flags"),
+        q("was anything repeat-masked?", "repeats"),
+        q("is it ready to order?", "summary"),
+        q("what does the penalty number mean?", "glossary"),
+        q("explain how piFISH probes work", "about_pifish"),
+        q("why is a hit for only one half not a problem?", "about_screening"),
+        q("what's the difference between a genomic and an RNA target?",
+          "target_types"),
+        q("what do the grey bars on the map show?", "probe_map"),
+        q("where do I download the sequences?", "how_order"),
+        q("how can I add a mouse genome index?", "how_setup"),
+        q("thanks!", "greeting"),
+        q("what's the weather like today?", "out_of_scope"),
     ]
 
 
@@ -112,8 +154,11 @@ class TurnResult:
     fields: dict = field(default_factory=dict)
     #: (field, wanted, got, ok) per expectation.
     checks: list = field(default_factory=list)
-    #: `reply_check` on an explain reply; None when the turn was not one.
+    #: `reply_check` on an explain reply the MODEL wrote (topic "other");
+    #: None when the turn was not one.
     reply_problems: list[str] | None = None
+    #: The software's own answer, when the topic had one (`agent.answers`).
+    answer: str = ""
     #: What the software changed on a change turn, in its own words.
     applied: list[str] = field(default_factory=list)
     designed: str = ""              # "6 pair(s) in 0.8 s" when it designed again
@@ -134,6 +179,9 @@ class TurnResult:
         out.append("    set: " + (" ".join(f"{k}={v}" for k, v in self.fields.items())
                                   or "nothing"))
         out.append(f"    note: {scrub(' '.join(self.note.split()))[:240]}")
+        if self.answer:
+            out.append(f"    answered by the software: "
+                       f"{scrub(' '.join(self.answer.split()))[:200]}")
         verdict = " ".join(f"{k}={'OK' if ok else f'WRONG({got!r})'}"
                            for k, _, got, ok in self.checks)
         out.append(f"    expected: {verdict} => {'PASS' if self.ok else 'FAIL'}")
@@ -152,6 +200,7 @@ class TurnResult:
                 "checks": [{"field": k, "wanted": sorted(w) if isinstance(w, (set, frozenset)) else w,
                             "got": g, "ok": ok} for k, w, g, ok in self.checks],
                 "ok": self.ok, "reply_problems": self.reply_problems,
+                "answer": scrub(self.answer),
                 "applied": self.applied, "designed": self.designed}
 
 
@@ -186,6 +235,10 @@ class BatteryReport:
     def reply_check_flags(self) -> int:
         return sum(1 for t in self.turns if t.reply_problems)
 
+    @property
+    def answered_by_software(self) -> int:
+        return sum(1 for t in self.turns if t.answer)
+
     def lines(self) -> list[str]:
         out = [f"== chat battery: {self.label} ==",
                f"synthetic target {self.sequence_nt:,} nt; opening design placed "
@@ -197,7 +250,8 @@ class BatteryReport:
         out.append("")
         out.append(f"==> {self.passed}/{self.total} turns as expected; model time "
                    f"{self.model_seconds:.0f} s total, {per_turn:.1f} s/turn; "
-                   f"{self.reply_check_flags} explain repl"
+                   f"{self.answered_by_software} question(s) answered by the "
+                   f"software; {self.reply_check_flags} model-written repl"
                    f"{'y' if self.reply_check_flags == 1 else 'ies'} flagged by the "
                    f"reply check; {self.designs} design(s) made")
         return out
@@ -208,6 +262,7 @@ class BatteryReport:
                 "design_seconds": round(self.design_seconds, 2),
                 "passed": self.passed, "total": self.total,
                 "model_seconds": round(self.model_seconds, 1),
+                "answered_by_software": self.answered_by_software,
                 "reply_check_flags": self.reply_check_flags, "designs": self.designs,
                 "turns": [t.to_dict() for t in self.turns]}
 
@@ -244,11 +299,11 @@ def run_turn(client, s: DesignSession, turn: Turn, history: list[dict],
     current = found if found.found else s.target
     on_target = (run if run and current and run.target_label == str(current)
                  else None)
+    windows = (scored_windows(on_target.results[0])
+               if on_target and len(on_target.results) == 1 else None)
     context = build_chat_context(
         message, s.params, str(current) if current else "", on_target,
-        screen=_screen_status(s, index_keys),
-        windows=(scored_windows(on_target.results[0])
-                 if on_target and len(on_target.results) == 1 else None))
+        screen=_screen_status(s, index_keys), windows=windows)
     request = chat_request(message, context, history)
     history.append({"role": "user", "text": message})
 
@@ -273,10 +328,22 @@ def run_turn(client, s: DesignSession, turn: Turn, history: list[dict],
         got = payload.get(key)
         ok = got in want if isinstance(want, (set, frozenset)) else got == want
         result.checks.append((key, want, got, ok))
+    shown = intent.note
     if intent.intent == "explain":
-        result.reply_problems = check_reply(
-            intent.note, CHAT_SYSTEM_PROMPT + "\n" + request,
-            enforce_window=s.params.enforce_window)
+        # As the app: the software answers every topic it has a template for,
+        # and only a model-written reply (topic "other") is checked.
+        written = answer(intent.topic, Asked(
+            message=message, params=s.params, run=on_target,
+            screen=context.specificity_screen,
+            target=str(current) if current else "", system_keys=system_keys,
+            n_pairs=intent.n_pairs, min_spacing=intent.min_spacing,
+            windows=windows))
+        if written is not None:
+            result.answer = shown = written.text
+        else:
+            result.reply_problems = check_reply(
+                intent.note, CHAT_SYSTEM_PROMPT + "\n" + request,
+                enforce_window=s.params.enforce_window)
 
     if intent.wants_design and turn.apply:
         new_params, changes = apply_intent(intent, s.params, system_keys)
@@ -288,7 +355,7 @@ def run_turn(client, s: DesignSession, turn: Turn, history: list[dict],
             # As the app: a setting the design uses moved, so design again.
             run, took = _design(s, new_params, seq)
             result.designed = f"{sum(r.n_pairs for r in run.results)} pair(s) in {took:.1f} s"
-    history.append({"role": "assistant", "text": intent.note})
+    history.append({"role": "assistant", "text": shown})
     return result
 
 

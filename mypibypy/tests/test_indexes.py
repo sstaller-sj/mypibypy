@@ -122,7 +122,7 @@ def test_a_wrong_kind_is_explained_in_one_set_of_words(tmp_path, built):
 def payload(**over):
     base = {"intent": "change", "system": UNCHANGED, "n_pairs": -1,
             "min_spacing": -1, "enforce_window": UNCHANGED, "screen": UNCHANGED,
-            "note": "ok"}
+            "topic": "none", "note": "ok"}
     base.update(over)
     return base
 

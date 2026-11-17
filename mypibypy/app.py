@@ -77,6 +77,7 @@ from mypibypy.agent.intent import (
     clean_pasted_sequence,
     unreadable_sequence_chars,
 )
+from mypibypy.agent.answers import Asked, after_design, answer, starters
 from mypibypy.agent.context import ScreenStatus, build_chat_context, facts_reply
 from mypibypy.agent.reply_check import checked_note, retry_request
 from mypibypy.agent.tools import window_stats
@@ -379,7 +380,8 @@ def design_registered(s: DesignSession, target, screen: str) -> bool:
                       n_pairs=params.n_pairs, min_spacing=params.min_spacing)
             if target.kind == "rna":
                 mode, label = "RNA transcript", obj.accession
-                form_target = target_from_form(mode, accession=obj.accession)
+                form_target = target_from_form(mode, accession=obj.accession,
+                                               gene=obj.gene, name=obj.name)
                 seq = run_design(cached_transcript, obj.accession)
                 one = seq and run_design(design_rna, obj, transcript_seq=seq, **kw)
             else:
@@ -388,7 +390,8 @@ def design_registered(s: DesignSession, target, screen: str) -> bool:
                 label = f"{iv.build} {iv.chrom}:{iv.start:,}-{iv.end:,}"
                 form_target = target_from_form(mode, build=iv.build,
                                                chrom=iv.chrom, start=iv.start,
-                                               end=iv.end)
+                                               end=iv.end, gene=obj.gene,
+                                               name=obj.name)
                 one = run_design(design_locus, obj, **kw)
             results = [one] if one else None
     if not results:
@@ -418,7 +421,7 @@ def design_for_target(target, params: DesignParameters, backend):
     from mypibypy.loci import RnaTarget
 
     if target.kind == "genomic":
-        locus = Locus("target", "GENE", "from chat",
+        locus = Locus(target.name or "target", target.gene or "GENE", "from chat",
                       GenomicInterval(target.build, target.chrom,
                                       target.start, target.end),
                       params.system)
@@ -426,7 +429,8 @@ def design_for_target(target, params: DesignParameters, backend):
                           screen=backend is not None, n_pairs=params.n_pairs,
                           min_spacing=params.min_spacing)
     if target.kind == "rna":
-        rna = RnaTarget("target", "GENE", target.accession, params.system)
+        rna = RnaTarget(target.name or "target", target.gene or "GENE",
+                        target.accession, params.system)
         seq = run_design(cached_transcript, target.accession)
         if seq is None:
             return None
@@ -434,7 +438,8 @@ def design_for_target(target, params: DesignParameters, backend):
                           screen=backend is not None, transcript_seq=seq,
                           n_pairs=params.n_pairs, min_spacing=params.min_spacing)
     if target.kind == "sequence":
-        rna = RnaTarget("target", "GENE", "pasted-sequence", params.system)
+        rna = RnaTarget(target.name or "target", target.gene or "GENE",
+                        "pasted-sequence", params.system)
         return run_design(design_rna, rna, backend=backend,
                           screen=backend is not None,
                           transcript_seq=target.sequence,
@@ -475,6 +480,11 @@ def chat_editor(s: DesignSession, client_kind: str,
     pick which constraint gives when nothing passes. Everything else -- the
     target, the design, the screens, the workbook -- is deterministic.
 
+    That includes the answers. A question comes back from the model as a
+    topic from a closed list (`agent.topics`), and the reply is written by the
+    software from the design (`agent.answers`). Only a question no topic fits
+    is answered in the model's words, and that reply is checked first.
+
     THE TARGET IS NEVER THE MODEL'S. It is pulled from the user's own words by
     `extract_target`, a strict pattern in the harness. The model has no field in
     which to supply a region, an accession or a sequence, which is what keeps
@@ -496,13 +506,33 @@ def chat_editor(s: DesignSession, client_kind: str,
             with st.chat_message(entry["role"]):
                 st.markdown(entry["text"])
 
+    # What the user might send next, offered as chips after each answer. A
+    # chip is an ordinary message: it takes the same path as a typed one. The
+    # key moves with the conversation, so a pick is read once and then gone.
+    follow_slot = st.empty()
+
+    def offer(suggestions) -> str | None:
+        if not suggestions:
+            follow_slot.empty()
+            return None
+        return follow_slot.pills("Suggested next messages", list(suggestions),
+                                 label_visibility="collapsed",
+                                 key=f"chat_follow_{len(history)}")
+
+    opening = () if history else starters(Asked(
+        message="", params=s.params, run=s.runs[-1] if s.runs else None,
+        target=str(s.target) if s.target else ""))
+    picked = offer(st.session_state.get("chat_follow_ups") or opening)
+
     # A turn takes 10-30 s on this hardware. A second message sent meanwhile
     # would queue behind it and both would run, so the box is disabled until
     # the turn is over.
-    message = st.chat_input("Ask for a design, or adjust one…",
-                            submit_mode="disable")
+    message = st.chat_input("Ask for a design, adjust one, or ask about it…",
+                            submit_mode="disable") or picked
     if not message:
         return
+    st.session_state["chat_follow_ups"] = []
+    follow_slot.empty()
 
     def say(role: str, text: str) -> None:
         history.append({"role": role, "text": text})
@@ -525,9 +555,11 @@ def chat_editor(s: DesignSession, client_kind: str,
     # final text only.
     reply_box = log.chat_message("assistant")
 
-    def finish(text: str) -> None:
+    def finish(text: str, follow_ups=()) -> None:
         history.append({"role": "assistant", "text": text})
         reply_box.markdown(text)
+        st.session_state["chat_follow_ups"] = list(follow_ups)
+        offer(follow_ups)
 
     # 1. The target comes from the user's words, by pattern, not from the model.
     found = extract_target(message)
@@ -558,8 +590,10 @@ def chat_editor(s: DesignSession, client_kind: str,
         reading.update(label="The model's reply was refused", state="error")
         finish(f"That reply did not fit the allowed shape and was refused: `{exc}`")
         return
-    reading.update(label=f"Read the request as *{intent.intent}* ({seconds:.1f} s)",
-                   state="complete")
+    asked_about = (f" about *{intent.topic.replace('_', ' ')}*"
+                   if intent.intent == "explain" else "")
+    reading.update(label=f"Read the request as *{intent.intent}*{asked_about} "
+                         f"({seconds:.1f} s)", state="complete")
 
     # The note is checked against what the model was shown before anyone sees
     # it (`reply_check`). An answer gets one retry and then the software's own
@@ -583,7 +617,18 @@ def chat_editor(s: DesignSession, client_kind: str,
                         state="complete" if ok else "error")
         return retried.note if ok else None
 
-    if intent.intent == "explain":
+    follow_ups: tuple[str, ...] = ()
+    written = answer(intent.topic, Asked(
+        message=message, params=s.params, run=on_target, screen=context.specificity_screen,
+        target=str(current) if current else "", system_keys=tuple(system_keys),
+        n_pairs=intent.n_pairs, min_spacing=intent.min_spacing,
+        windows=(windows_for(on_target, 0)
+                 if on_target and len(on_target.results) == 1 else None),
+    )) if intent.intent == "explain" else None
+    if written is not None:
+        # The software's own answer: nothing of the model's is in it to check.
+        note, follow_ups = written.text, written.follow_ups
+    elif intent.intent == "explain":
         note, settled = checked_note(
             intent.note, grounds, enforce_window=s.params.enforce_window,
             ask_again=ask_again, fallback=facts_reply(context))
@@ -613,6 +658,8 @@ def chat_editor(s: DesignSession, client_kind: str,
     elif intent.intent == "unclear":
         lines.append("Nothing was changed." + ("" if s.target else
                      " Tell me the target and what you want designed."))
+        follow_ups = starters(Asked(message=message, params=s.params, run=on_target,
+                                    target=str(s.target) if s.target else ""))
     elif not s.target:
         lines.append("I have the parameters but no target yet. Give me a "
                      "region like `chr7:5530000-5531000`, an accession "
@@ -668,13 +715,17 @@ def chat_editor(s: DesignSession, client_kind: str,
             else:
                 lines.append(f"Screened against **{screened_against}**.")
             lines.append(f"_Windows: {windows_text([result], new_params)[0]}._")
+            follow_ups = after_design(Asked(
+                message=message, params=new_params, run=run,
+                screen=screen_status(s.screen), target=str(target),
+                system_keys=tuple(system_keys)))
             previews = try_changes([result], new_params, windows_for(run, 0))
             if previews:
                 lines.append("**What would place more:**\n"
                              + "\n".join(f"- {p.text}" for p in previews)
                              + f"\n\n_{PREVIEW_CAVEAT}_")
 
-    finish("\n\n".join(lines))
+    finish("\n\n".join(lines), follow_ups)
 
 
 # --- form editor -----------------------------------------------------------
@@ -816,7 +867,8 @@ def form_editor(s: DesignSession, system_keys: list[str],
                 results, label = [one], f"{build} {chrom}:{start:,}-{end:,}"
                 note = f"mypibypy UI: {locus.interval}, system {system_key}."
                 form_target = target_from_form(mode, build=build, chrom=chrom,
-                                               start=start, end=end)
+                                               start=start, end=end, gene=gene,
+                                               name=name)
 
                 def redesign(p: DesignParameters, locus=locus):
                     return run_design(design_locus, replace(locus, system=p.system),
@@ -866,7 +918,8 @@ def form_editor(s: DesignSession, system_keys: list[str],
                 results, label = [one], accession.strip()
                 note = (f"mypibypy UI: RNA target {accession}, "
                         f"system {system_key}.")
-                form_target = target_from_form(mode, accession=accession.strip())
+                form_target = target_from_form(mode, accession=accession.strip(),
+                                               gene=gene)
 
                 def redesign(p: DesignParameters, rna=rna, seq=seq,
                              expression=expression):
@@ -1506,7 +1559,8 @@ def show_tutorial() -> None:
             params = replace(params, system=locus.system)
         s.update(params=params,
                  target=target_from_form("Genomic region", build=iv.build,
-                                         chrom=iv.chrom, start=iv.start, end=iv.end))
+                                         chrom=iv.chrom, start=iv.start, end=iv.end,
+                                         gene=locus.gene, name=locus.name))
         st.session_state["open_editor"] = "Form"
         st.switch_page(workspace_page)
 

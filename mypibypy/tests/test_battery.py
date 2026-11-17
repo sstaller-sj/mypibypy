@@ -38,7 +38,8 @@ def expected_replies(keys=KEYS) -> list[dict]:
     for turn in turns(keys):
         payload = {"intent": "change", "system": UNCHANGED, "n_pairs": UNCHANGED_INT,
                    "min_spacing": UNCHANGED_INT, "enforce_window": UNCHANGED,
-                   "screen": UNCHANGED, "note": "The design has 4 pairs."}
+                   "screen": UNCHANGED, "topic": "none",
+                   "note": "The design has 4 pairs."}
         for key, want in turn.expect.items():
             payload[key] = sorted(want)[0] if isinstance(want, (set, frozenset)) else want
         out.append(payload)
@@ -53,7 +54,7 @@ def perfect():
 
 class TestScoring:
     def test_a_model_that_answers_as_expected_passes_every_turn(self, perfect):
-        assert perfect.total == 10
+        assert perfect.total == len(turns(KEYS)) == 31
         assert perfect.passed == perfect.total, [t.lines() for t in perfect.turns
                                                  if not t.ok]
         assert not perfect.unreachable
@@ -63,7 +64,7 @@ class TestScoring:
         replies[3]["n_pairs"] = 7                       # "make it 6 pairs"
         report = run_battery(ScriptedClient(structured_replies=replies),
                              system_keys=KEYS)
-        assert report.passed == 9
+        assert report.passed == report.total - 1
         failed = [t for t in report.turns if not t.ok]
         assert len(failed) == 1 and "make it 6 pairs" in failed[0].message
         assert any("WRONG(7)" in line for line in failed[0].lines())
@@ -98,11 +99,38 @@ class TestItRunsTheChatPath:
         loosen = next(t for t in perfect.turns if "loosen the Tm" in t.message)
         assert loosen.applied == [] and loosen.designed == ""
 
-    def test_explain_replies_go_through_the_reply_check(self, perfect):
-        explains = [t for t in perfect.turns if t.reply_problems is not None]
-        assert len(explains) >= 4
-        assert all(t.reply_problems == [] for t in explains), \
-            "a note quoting the design's own pair count is grounded"
+    def test_a_question_with_a_topic_is_answered_by_the_software(self, perfect):
+        """As the app: the model's part is the topic, and the reply is written
+        from the design. Nothing of the model's is in it, so it is not put
+        through the reply check."""
+        answered = [t for t in perfect.turns if t.answer]
+        assert len(answered) == perfect.answered_by_software >= 24
+        assert all(t.reply_problems is None for t in answered)
+        why = next(t for t in answered if t.message.startswith("why did I only get"))
+        assert why.answer.startswith("Placed ")
+        assert any("answered by the software" in line for line in why.lines())
+
+    def test_a_question_is_never_applied_even_with_a_number_in_it(self, perfect):
+        fit = next(t for t in perfect.turns if t.message == "would 10 pairs fit?")
+        assert fit.ok and fit.applied == [] and fit.designed == ""
+        assert "10" in fit.answer and "placed" in fit.answer
+
+    def test_a_follow_up_is_answered_about_the_pair_it_names(self, perfect):
+        three = next(t for t in perfect.turns if t.message == "and pair 3?")
+        assert "Pair 3" in three.answer
+
+    def test_a_model_written_reply_still_goes_through_the_reply_check(self):
+        """Topic "other" is the one answer the model writes itself."""
+        replies = expected_replies()
+        index = next(i for i, t in enumerate(turns(KEYS))
+                     if t.message == "is it ready to order?")
+        replies[index].update(topic="other", note="The design has 99 pairs.")
+        report = run_battery(ScriptedClient(structured_replies=replies),
+                             system_keys=KEYS)
+        turn = report.turns[index]
+        assert turn.answer == "" and not turn.ok
+        assert turn.reply_problems and "99" in turn.reply_problems[0]
+        assert report.reply_check_flags == 1
 
     def test_the_screen_request_is_applied_without_screening(self, perfect):
         screen = next(t for t in perfect.turns if t.message == "screen against hg38")

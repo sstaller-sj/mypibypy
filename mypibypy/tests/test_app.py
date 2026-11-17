@@ -27,7 +27,7 @@ SEQ = "".join(_RNG.choice("ACGT") for _ in range(400))
 def intent(**over):
     base = {"intent": "change", "system": UNCHANGED, "n_pairs": UNCHANGED_INT,
             "min_spacing": UNCHANGED_INT, "enforce_window": UNCHANGED,
-            "screen": UNCHANGED, "note": "ok"}
+            "screen": UNCHANGED, "topic": "none", "note": "ok"}
     return base | over
 
 
@@ -179,6 +179,64 @@ class TestChat:
         assert not at.exception
         text = shown(at)
         assert "pairs → 3" in text and "run #2" in text
+
+    def test_a_question_is_answered_by_the_software_not_the_model(self, app,
+                                                                  monkeypatch):
+        """The model picks the topic; the reply is the design's own numbers.
+        Its note -- here a wrong one -- is not shown."""
+        key = sorted(systems())[0]
+        scripted(monkeypatch, [
+            intent(system=key, n_pairs=2),
+            intent(intent="explain", topic="pair_detail",
+                   note="Pair 2 has a Tm of 99 C."),
+        ])
+        at = on_workspace(app)
+        at.chat_input[0].set_value(f"design 2 pairs in {key} for {SEQ}").run()
+        at.chat_input[0].set_value("what's the Tm of pair 2?").run()
+        assert not at.exception
+        text = shown(at)
+        assert "Pair 2's Tm is" in text and "99 C" not in text
+        assert "run #2" not in text, "a question designs nothing"
+
+    def test_a_question_with_a_number_in_it_previews_and_changes_nothing(
+            self, app, monkeypatch):
+        key = sorted(systems())[0]
+        scripted(monkeypatch, [
+            intent(system=key, n_pairs=2),
+            intent(intent="explain", topic="what_if", n_pairs=3, note="Let me see."),
+        ])
+        at = on_workspace(app)
+        at.chat_input[0].set_value(f"design 2 pairs in {key} for {SEQ}").run()
+        at.chat_input[0].set_value("would 3 fit?").run()
+        assert not at.exception
+        text = shown(at)
+        assert "Pairs 2 → 3:" in text and "Previews re-run placement only" in text
+        assert "Applied" not in text.split("would 3 fit?")[-1] and "run #2" not in text
+
+    def test_a_follow_up_chip_is_sent_as_the_next_message(self, app, monkeypatch):
+        """Each answer offers what to ask next. A chip is an ordinary message:
+        picking it runs a turn, exactly as typing it would."""
+        key = sorted(systems())[0]
+        scripted(monkeypatch, [
+            intent(system=key, n_pairs=2),
+            intent(intent="explain", topic="summary", note="ok"),
+            intent(intent="explain", topic="best_worst", note="ok"),
+        ])
+        at = on_workspace(app)
+        at.chat_input[0].set_value(f"design 2 pairs in {key} for {SEQ}").run()
+        offered = at.pills[0].options
+        assert "is this design ok?" in offered
+        at.pills[0].set_value("is this design ok?").run()
+        assert not at.exception
+        assert "Run #1 on" in shown(at)
+        assert "which pair is the weakest?" in at.pills[0].options
+        at.pills[0].set_value("which pair is the weakest?").run()
+        assert not at.exception
+        assert "Best ranked: pair" in shown(at)
+
+    def test_a_new_chat_offers_somewhere_to_start(self, app):
+        at = on_workspace(app)
+        assert "how does this work?" in at.pills[0].options
 
 
 class TestFormAgentLoop:

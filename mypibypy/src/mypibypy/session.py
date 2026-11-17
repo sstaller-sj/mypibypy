@@ -127,17 +127,23 @@ def changed_params(before: DesignParameters | None,
 
 def target_from_form(mode: str, *, build: str = "", chrom: str = "",
                      start: int = 0, end: int = 0, accession: str = "",
-                     sequence: str = "") -> ExtractedTarget | None:
+                     sequence: str = "", gene: str = "",
+                     name: str = "") -> ExtractedTarget | None:
     """The form's target in the chat's terms, so the chat can keep working on it.
+
+    `gene` and `name` are the design's labels; they ride along so the chat
+    names the oligos, and tells on-target hits from off-target ones, as the
+    form did.
 
     A fusion junction has no `ExtractedTarget` form -- it is chosen from the
     loci file, never typed -- so it leaves the chat's target alone.
     """
     if mode == "Genomic region":
         return ExtractedTarget("genomic", build=build, chrom=chrom,
-                               start=start, end=end)
+                               start=start, end=end, gene=gene, name=name)
     if mode == "RNA transcript":
-        return ExtractedTarget("rna", accession=accession)
+        return ExtractedTarget("rna", accession=accession, gene=gene, name=name)
     if mode == "Pasted sequence":
-        return ExtractedTarget("sequence", sequence=sequence)
+        return ExtractedTarget("sequence", sequence=sequence, gene=gene,
+                               name=name)
     return None

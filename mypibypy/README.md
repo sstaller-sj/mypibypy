@@ -78,7 +78,7 @@ Windows use WSL2.
 Then configure your amplifier systems (see below) and run the tests:
 
 ```bash
-pytest                    # 867 tests, no PYTHONPATH needed
+pytest                    # 963 tests, no PYTHONPATH needed
 ```
 
 ## Usage
@@ -751,11 +751,35 @@ Switch **Interface** to *Chat* and talk to it:
 > **make it 6 pairs at 20 nt spacing**
 > **Applied:** pairs → 6; minimum spacing → 20 nt
 
+> **why is pair 2 worse than pair 1?**
+> Pair 2 ranks better than pair 1: its penalty is 1.108 against 2.654, and
+> lower is better. …
+> `tell me about pair 1` · `what is penalty?`
+
 The model does **two things** in this path: turn a request into parameters
 (channel, pair count, spacing, which named index to screen against, whether
-the GC/Tm window is enforced), and answer questions by repeating the facts the
-software worked out (`diagnosis`). The design, the screens, the thermodynamics
-and the workbook are all deterministic.
+the GC/Tm window is enforced), and say which kind of question was asked. The
+design, the screens, the thermodynamics, the workbook and **the answers** are
+all deterministic.
+
+**Answers are written by the software.** A question comes back from the model
+as a `topic` from a closed list of 22 (`agent/topics.py`): why fewer pairs were
+placed, what the screen found, one pair or two compared, what another pair
+count or spacing would place, what a term means, how to order. The reply for
+each is a template in `agent/answers.py`, filled from the design itself and the
+sentences `diagnosis` worked out, so a number in an answer is the number in the
+design. A small model is reliable at choosing among a few things and unreliable
+at composing: handed two numbers, it called 70.4 "higher" than 73.8. Each
+answer ends with two or three follow-ups as chips; a chip is an ordinary
+message and takes the same path as a typed one.
+
+A question may carry a number (*would 10 pairs fit?*). That is answered with a
+placement preview and changes nothing: only a `change` moves a setting. A
+question about the design that no topic fits (`other`) is the one reply the
+model still writes itself, from the facts it was shown; it is checked
+(`reply_check`) and replaced by those facts if a number in it is not in the
+design. Anything else is `out_of_scope` and gets a fixed reply saying what the
+chat can do.
 
 **The target is never the model's.** It is pulled out of the user's own words by
 `intent.extract_target`, a strict pattern in the harness — so a pasted run of
@@ -773,11 +797,15 @@ would change the design, instead of designing the same thing again under a
 comment promising a change.
 
 The intent the model fills in is three values — `change`, `explain`, `unclear` —
-plus the settings; there is no action field. `scripts/benchmark_chat.py` runs
-ten scripted chat turns on a synthetic sequence through exactly this path and
-scores what the model returned, with the time each turn took and whether the
-reply check passed. It is the quickest answer to "is the harness working on
-this machine" and "can a smaller model do this", and it touches no lab data.
+plus the settings and the topic; there is no action field.
+`scripts/benchmark_chat.py` runs 31 scripted chat turns on a synthetic sequence
+through exactly this path and scores what the model returned: ten requests and
+follow-ups, then one question per topic, each worded differently from the
+example the model's guide gives for it. It reports the time each turn took, how
+many questions the software answered, and whether any model-written reply
+failed the check. It is the quickest answer to "is the harness working on this
+machine" and "can a smaller model do this", and it touches no lab data. On
+qwen3.5:9b (2026-11-17): 31 of 31, 7.4 s a turn.
 
 ## Driving it from Claude (MCP server)
 
