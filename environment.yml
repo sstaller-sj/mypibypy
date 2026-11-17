@@ -9,9 +9,15 @@
 # Windows use WSL2, or a container built from this file.
 #
 # Not here, because conda cannot supply them: the bowtie indexes to screen
-# against (see "Pair-aware genome screening" in mypibypy/README.md) and Ollama
-# with its model for the chat (see "Which model"). Both are optional; without
-# an index a design says NOT SCREENED, and without a model the Form still works.
+# against (see "Pair-aware genome screening" in mypibypy/README.md) and the
+# model the chat and the agent loop use (see "Which model"). Ollama itself is
+# installed below; start it and pull the model once:
+#
+#     ollama serve &
+#     ollama pull qwen3.5:9b
+#
+# Both are optional; without an index a design says NOT SCREENED, and without
+# a running model the Form, Batch and the MCP server still work.
 name: pifish-tools
 channels:
   - conda-forge
@@ -35,6 +41,9 @@ dependencies:
   - pandas
   - altair
   - pytest>=8
+  # The local model server for the chat and the agent loop. The app talks to it
+  # over HTTP on 127.0.0.1:11434 and nothing imports it.
+  - ollama
   - pip:
       # The package, editable, with the MCP server (`python -m mypibypy mcp`)
       # and the PydanticAI decision client, which tests/test_models.py needs;
