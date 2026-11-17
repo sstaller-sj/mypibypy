@@ -64,7 +64,8 @@ sequences and target/fusion designs. Keep them in a local `designs/` directory.
 The design core is pure Python, but specificity screening shells out to BLAST
 and bowtie, which are not pip-installable. Create the environment with conda,
 from the repository root; `environment.yml` there lists the tools, the UI's
-packages and this package in editable mode with the MCP server:
+packages and this package in editable mode with the MCP server and the
+PydanticAI decision client:
 
 ```bash
 conda env create -f environment.yml

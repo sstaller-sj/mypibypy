@@ -36,6 +36,7 @@ dependencies:
   - altair
   - pytest>=8
   - pip:
-      # The package, editable, with the MCP server (`python -m mypibypy mcp`).
-      # The path is relative to this file.
-      - -e ./mypibypy[mcp]
+      # The package, editable, with the MCP server (`python -m mypibypy mcp`)
+      # and the PydanticAI decision client, which tests/test_models.py needs;
+      # without it that module is skipped. The path is relative to this file.
+      - -e ./mypibypy[mcp,pydantic-ai]
