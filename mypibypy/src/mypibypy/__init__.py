@@ -20,7 +20,7 @@ from .sequence import GenomicInterval, fetch_sequence, revcomp
 from .specificity import SpecificityReport, resolve_backend, screen_pair
 from .systems import AmplifierSystem, get_system, is_example, loaded_from, systems
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # `SYSTEM_1` / `SYSTEM_2` are deliberately not re-exported here: importing them
 # would load the systems file at import time, and `import mypibypy` must work

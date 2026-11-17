@@ -1,14 +1,16 @@
 cff-version: 1.2.0
 title: mypibypy
 abstract: >-
-  piFISH split-probe (P1L/P1R) design into reusable amplifier systems, with
-  amplifier-pool cross-hybridization screening and buffer-aware duplex
-  thermodynamics.
+  piFISH split-probe (P1L/P1R) design into reusable amplifier systems for
+  genomic loci, fusion junctions and RNA targets, with pair-aware local
+  specificity screening, amplifier-pool cross-hybridization screening and
+  buffer-aware duplex thermodynamics. Usable from the command line, a
+  browser UI or as MCP tools.
 authors:
   - family-names: Staller
     given-names: Seth
     affiliation: St. Jude Children's Research Hospital
 license: MIT
 repository-code: https://github.com/sstaller-sj/mypibypy
-version: 0.1.0
-date-released: 2026-10-15
+version: 0.2.0
+date-released: 2026-11-17

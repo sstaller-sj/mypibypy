@@ -77,7 +77,7 @@ Windows use WSL2.
 Then configure your amplifier systems (see below) and run the tests:
 
 ```bash
-pytest                    # about 770 tests, no PYTHONPATH needed
+pytest                    # 867 tests, no PYTHONPATH needed
 ```
 
 ## Usage
